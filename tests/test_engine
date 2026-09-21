@@ -1,0 +1,23 @@
+import numpy as np
+from attendance.engine import best_match
+
+rng = np.random.default_rng(0)
+unit = lambda v: v / np.linalg.norm(v)
+
+def make_db():
+    a, b = unit(rng.normal(size=128)), unit(rng.normal(size=128))
+    return {"A": [unit(a + 0.02 * rng.normal(size=128)) for _ in range(4)],
+            "B": [unit(b + 0.02 * rng.normal(size=128)) for _ in range(4)]}, a
+
+def test_match_known():
+    db, a = make_db()
+    assert best_match(a, db, tolerance=0.6)[0] == "A"
+
+def test_reject_unknown():
+    db, _ = make_db()
+    assert best_match(unit(rng.normal(size=128)), db, tolerance=0.6)[0] is None
+
+def test_bad_sample_does_not_break_match():
+    db, a = make_db()
+    db["A"].append(unit(rng.normal(size=128)))       # one corrupted sample
+    assert best_match(a, db, tolerance=0.6)[0] == "A"
