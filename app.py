@@ -64,7 +64,7 @@ if mode == "➕ Enroll person":
                            key=f"cam{st.session_state.shot}")
     if shot is not None:
         rgb = to_rgb(shot)
-        locs, encs = detect_and_encode(rgb, scale=1.0)     # enroll at full resolution
+        locs, encs = detect_and_encode(rgb, scale=1.0, num_jitters=cfg.enroll_jitters)     # enroll at full resolution
         box = largest_face(locs)
         if box is None:
             st.error("No face detected — move closer / improve lighting, then retake.")

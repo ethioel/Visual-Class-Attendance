@@ -8,14 +8,15 @@ Face = Tuple[int, int, int, int]                 # (top, right, bottom, left), s
 Recognition = Tuple[Face, str, bool, float]      # box, label, is_known, distance
 
 
-def detect_and_encode(rgb, scale: float = 1.0, model: str = "hog"):
-    """Detect + encode. Coordinates are returned in the ORIGINAL image scale."""
+def detect_and_encode(rgb, scale: float = 1.0, model: str = "hog", num_jitters: int = 1):
+    """Detect + encode. num_jitters>1 averages perturbed crops (slower, more stable).
+    Coordinates are returned in the ORIGINAL image scale."""
     import cv2
     import face_recognition  # lazy: keeps tests and CI dlib-free
 
     work = rgb if scale >= 1.0 else cv2.resize(rgb, None, fx=scale, fy=scale)
     locs = face_recognition.face_locations(work, model=model)
-    encs = face_recognition.face_encodings(work, locs)
+    encs = face_recognition.face_encodings(work, locs, num_jitters=num_jitters)
     if scale != 1.0:
         inv = 1.0 / scale
         locs = [(int(t * inv), int(r * inv), int(b * inv), int(l * inv)) for t, r, b, l in locs]
