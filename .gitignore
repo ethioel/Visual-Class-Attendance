@@ -1,0 +1,17 @@
+# biometric + personal data — never commit
+attendance_db/
+*.xlsx
+*.csv
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# editor/os
+.DS_Store
+.idea/
+.vscode/
+.streamlit/secrets.toml
