@@ -1,10 +1,19 @@
+"""Presentation helpers: theme-aware CSS, pills, sections, thumbnails."""
 from __future__ import annotations
 
 import cv2
 import numpy as np
 import streamlit as st
 
-CSS = """
+
+def theme_is_dark() -> bool:
+    try:
+        return str(getattr(st.context.theme, "type", "light")).lower() == "dark"
+    except Exception:
+        return False
+
+
+_CSS = """
 header[data-testid="stHeader"]{background:transparent;}
 footer{visibility:hidden;}
 section[data-testid="stSidebar"]{background:linear-gradient(180deg,#0F172A,#1E293B);border-right:none;}
@@ -27,6 +36,8 @@ div[data-testid="stVerticalBlockBorderWrapper"]{border-radius:14px;border:1px so
 .sec{display:flex;align-items:center;gap:.5rem;font-weight:800;font-size:1.15rem;margin:.3rem 0 1rem;}
 .sec .ico{display:inline-flex;width:34px;height:34px;border-radius:10px;background:#EEF2FF;color:#4F46E5;align-items:center;justify-content:center;}
 .muted{color:#64748B;font-size:.85rem;}
+.sugg{font-size:1.05rem;font-weight:700;padding:.6rem .9rem;border-radius:12px;background:#EEF2FF;color:#3730A3;border:1px solid #C7D2FE;}
+.sugg.ok{background:#DCFCE7;color:#166534;border-color:#BBF7D0;}
 .userchip{display:flex;gap:.6rem;align-items:center;margin:.6rem 0;}
 .avatar{width:38px;height:38px;border-radius:50%;background:linear-gradient(135deg,#4F46E5,#8B5CF6);color:#fff;font-weight:800;display:flex;align-items:center;justify-content:center;}
 .uname{font-weight:700;font-size:.9rem;color:#0F172A;}
@@ -39,9 +50,33 @@ div[data-testid="stVerticalBlockBorderWrapper"]{border-radius:14px;border:1px so
 [data-testid="stSidebar"] ::-webkit-scrollbar-thumb{background:#334155;}
 """
 
+_DARK = """
+[data-testid="stAppViewContainer"],[data-testid="stAppViewContainer"] section.stMain{background:#0B1220;}
+[data-testid="stMarkdownContainer"],.stApp{color:#E5E7EB;}
+h1,h2,h3,h4,.uname{color:#F1F5F9;}
+div[data-testid="stVerticalBlockBorderWrapper"]{background:#111827;border-color:#1F2937;box-shadow:none;}
+[data-testid="stMetric"]{background:#111827;border-color:#1F2937;}
+[data-testid="stMetricLabel"] p{color:#94A3B8;}
+[data-testid="stMetricValue"]{color:#F1F5F9;}
+[data-testid="stTextInput"] input{background:#0F172A;color:#E5E7EB;border:1px solid #334155;}
+[data-testid="stTextArea"] textarea{background:#0F172A;color:#E5E7EB;border:1px solid #334155;}
+[data-baseweb="select"]>div{background:#0F172A;color:#E5E7EB;border-color:#334155;}
+[data-testid="stCaptionContainer"],.muted{color:#94A3B8;}
+[data-testid="stDataFrame"]{border-color:#1F2937;}
+[data-testid="stExpander"],hr{border-color:#1F2937;}
+[data-testid="stDateInput"] input,[data-testid="stTimeInput"] input{background:#0F172A;color:#E5E7EB;}
+.pill-muted{background:#334155;color:#CBD5E1;}
+.sugg{background:#1E1B4B;color:#C7D2FE;border-color:#3730A3;}
+.sugg.ok{background:#052E16;color:#86EFAC;border-color:#166534;}
+::-webkit-scrollbar-thumb{background:#334155;}
+"""
 
-def inject_css() -> None:
-    st.markdown(f"<style>{CSS}</style>", unsafe_allow_html=True)
+_HIDE_SIDEBAR = 'section[data-testid="stSidebar"]{display:none!important;}'
+
+
+def inject_css(hide_sidebar: bool = False) -> None:
+    css = _CSS + (_DARK if theme_is_dark() else "") + (_HIDE_SIDEBAR if hide_sidebar else "")
+    st.markdown(f"<style>{css}</style>", unsafe_allow_html=True)
 
 
 def section(icon: str, title: str) -> None:
@@ -53,33 +88,29 @@ def pill(text: str, kind: str) -> str:
     return f'<span class="pill pill-{kind}">{text}</span>'
 
 
-STATUS_KIND = {"Present": "present", "Late": "late", "Absent": "absent"}
 STATUS_EMOJI = {"Present": "✅ Present", "Late": "⏰ Late", "Absent": "🚫 Absent"}
 
 
 def user_chip(user: dict) -> None:
     initials = "".join(w[0] for w in user["username"].replace("-", " ").split()[:2]).upper() or "U"
-    st.markdown(
-        f'<div class="userchip"><div class="avatar">{initials}</div><div>'
-        f'<div class="uname">{user["username"]}</div>{pill(user["role"], user["role"])}'
-        f"</div></div>", unsafe_allow_html=True)
+    st.markdown(f'<div class="userchip"><div class="avatar">{initials}</div><div>'
+                f'<div class="uname">{user["username"]}</div>{pill(user["role"], user["role"])}</div></div>',
+                unsafe_allow_html=True)
 
 
 def empty_state(icon: str, title: str, hint: str = "") -> None:
-    st.markdown(
-        f'<div style="text-align:center;padding:2.2rem 1rem;">'
-        f'<div style="font-size:2.2rem;">{icon}</div>'
-        f'<div style="font-weight:700;margin:.4rem 0;">{title}</div>'
-        f'<div class="muted">{hint}</div></div>', unsafe_allow_html=True)
+    st.markdown(f'<div style="text-align:center;padding:2.2rem 1rem;">'
+                f'<div style="font-size:2.2rem;">{icon}</div>'
+                f'<div style="font-weight:700;margin:.4rem 0;">{title}</div>'
+                f'<div class="muted">{hint}</div></div>', unsafe_allow_html=True)
 
 
 def hero() -> None:
-    st.markdown(
-        '<div class="hero"><h1>🪪 Visual Attendance</h1>'
-        "<p>Face-first classroom operations — enroll once, scan the room, done.</p>"
-        '<div class="chips"><span>Multi-sample enrollment</span><span>Roster-scoped matching</span>'
-        "<span>Late rules per class</span><span>Live dashboard</span></div></div>",
-        unsafe_allow_html=True)
+    st.markdown('<div class="hero"><h1>🪪 Visual Attendance</h1>'
+                "<p>Face-first classroom operations — enroll once, scan the room, done.</p>"
+                '<div class="chips"><span>Multi-sample enrollment</span><span>Roster-scoped matching</span>'
+                "<span>Live auto-capture</span><span>Dark mode</span></div></div>",
+                unsafe_allow_html=True)
 
 
 def render_flash() -> None:
@@ -90,6 +121,11 @@ def render_flash() -> None:
 
 def flash(kind: str, msg: str) -> None:
     st.session_state["flash"] = (kind, msg)
+
+
+def suggestion_box(text: str) -> None:
+    st.markdown(f'<div class="sugg {"ok" if text.startswith("✅") else ""}">{text}</div>',
+                unsafe_allow_html=True)
 
 
 def face_thumb(rgb: np.ndarray, box, size: int = 88) -> np.ndarray:
