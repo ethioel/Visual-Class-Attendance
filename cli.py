@@ -30,7 +30,8 @@ def main() -> None:
         frame_i += 1
         if frame_i % cfg.frame_skip == 0:
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            last = recognize(rgb, encodings, tolerance=cfg.tolerance, scale=cfg.detect_scale)
+            last = recognize(rgb, encodings, tolerance=cfg.tolerance,
+                             scale=cfg.detect_scale)
             for box, label, known, dist in last:
                 if known:
                     store.mark(label, people.get(label, {}).get("name", label))
@@ -40,13 +41,15 @@ def main() -> None:
                             f"unknown_{datetime.now():%H%M%S}.jpg"), frame)
         out = annotate(frame.copy(), last)
         fps = 1.0 / max(1e-3, time.time() - t0); t0 = time.time()
-        cv2.putText(out, f"FPS {fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        cv2.putText(out, f"FPS {fps:.1f}", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
         cv2.imshow("Attendance", out)
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"): break
         if key == ord(" "): print("absent marked:", store.mark_absent_all())
         if key == ord("s"):
-            cv2.imwrite(os.path.join(cfg.snapshot_dir, f"snap_{datetime.now():%H%M%S}.jpg"), frame)
+            cv2.imwrite(os.path.join(cfg.snapshot_dir,
+                        f"snap_{datetime.now():%H%M%S}.jpg"), frame)
     store.mark_absent_all()
     cam.release()
     cv2.destroyAllWindows()
