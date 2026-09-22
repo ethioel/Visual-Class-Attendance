@@ -1,0 +1,27 @@
+from attendance.auth import Auth
+from attendance.config import Config
+
+
+def make_auth(tmp_path):
+    return Auth(Config(db_dir=str(tmp_path), late_after=None))
+
+
+def test_bootstrap_admin(tmp_path):
+    assert make_auth(tmp_path).list_users("admin")
+
+
+def test_add_verify(tmp_path):
+    a = make_auth(tmp_path)
+    assert a.add_user("tsec", "secret123")
+    assert a.verify("TSEC", "secret123")["role"] == "teacher"
+    assert a.verify("tsec", "nope") is None
+
+
+def test_rules(tmp_path):
+    a = make_auth(tmp_path)
+    assert not a.add_user("x", "short")
+    assert a.add_user("x", "longenough")
+    assert not a.add_user("x", "another1")
+    assert a.set_password("x", "newpassword") and a.verify("x", "newpassword")
+    assert not a.remove_user("admin")
+    assert a.remove_user("x")
