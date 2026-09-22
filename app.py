@@ -1,7 +1,5 @@
-import logging
+import base64
 import os
-import threading
-import time
 from io import BytesIO
 
 import altair as alt
@@ -9,6 +7,7 @@ import cv2
 import numpy as np
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 try:
     for _k, _v in st.secrets.get("env", {}).items():
@@ -16,20 +15,9 @@ try:
 except Exception:
     pass
 
-
-class _IceRetryNoise(logging.Filter):
-    """Silence aioice STUN retry tracebacks (dead transport after widget teardown)."""
-    def filter(self, record):
-        msg = record.getMessage()
-        return "Transaction.__retry" not in msg and "sendto" not in msg
-
-
-logging.getLogger("asyncio").addFilter(_IceRetryNoise())
-
 from attendance.auth import Auth
 from attendance.config import Config
-from attendance.engine import (_get_backend, annotate, detect_and_encode,
-                               largest_face, recognize)
+from attendance.engine import annotate, detect_and_encode, largest_face, recognize
 from attendance.store import Store
 from attendance.ui import (STATUS_EMOJI, empty_state, face_thumb, flash, hero,
                            inject_css, render_flash, section, suggestion_box,
@@ -41,8 +29,12 @@ st.set_page_config(page_title="Visual Attendance", page_icon="🪪", layout="wid
 MAIN_DB = os.environ.get("ATT_DB_DIR", "attendance_db")
 GUEST_DB = "demo_db"
 STATUS_OPTS = ["—", "Present", "Late", "Excused", "Absent"]
-WORK_WIDTH = 960          # live detection working width (px)
-LIVE_PROB = 0.85          # MTCNN prob threshold for live frames (0.90 too strict)
+WORK_WIDTH = 960          # recognition working width (px)
+LIVE_PROB = 0.85          # MTCNN prob threshold for camera frames
+
+_COMP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "components", "autocam")
+_autocam = components.declare_component("autocam", path=_COMP_DIR)
 
 
 @st.cache_resource
@@ -74,43 +66,6 @@ def to_working(rgb, max_w: int = WORK_WIDTH):
     return rgb, 1.0
 
 
-# ---------------- live camera machinery ----------------
-_CAM = {"lock": threading.Lock(), "frame": None, "i": 0}
-
-
-def _on_frame(frame):
-    """aiortc thread: ONLY capture the frame — no ML here, cannot fail."""
-    try:
-        img = frame.to_ndarray(format="bgr24")
-        with _CAM["lock"]:
-            _CAM["frame"] = img
-            _CAM["i"] += 1
-    except Exception:
-        pass
-    return frame
-
-
-_ICE = {"iceServers": [
-    {"urls": "stun:stun.l.google.com:19302"},
-    {"urls": "turn:openrelay.metered.ca:80",
-     "username": "openrelayproject", "credential": "openrelayproject"},
-    {"urls": "turn:openrelay.metered.ca:443?transport=tcp",
-     "username": "openrelayproject", "credential": "openrelayproject"},
-]}
-
-
-def _webrtc(key: str):
-    from streamlit_webrtc import webrtc_streamer
-    return webrtc_streamer(key=key, video_frame_callback=_on_frame,
-                           rtc_configuration=_ICE,
-                           media_stream_constraints={
-                               "video": {"width": {"ideal": 1280},
-                                         "height": {"ideal": 720},
-                                         "facingMode": "user"},
-                               "audio": False},
-                           async_processing=True)
-
-
 def live_suggestion(n_faces: int, brightness: float, sharpness: float) -> str:
     if brightness < 55:
         return "☀️ Too dark — face a light"
@@ -120,9 +75,7 @@ def live_suggestion(n_faces: int, brightness: float, sharpness: float) -> str:
         return "📸 Hold still — blurry"
     if n_faces == 0:
         return "🙂 No face in frame — step into view"
-    if n_faces > 1:
-        return "👥 Multiple faces — fine, all will be checked"
-    return "✅ Good — hold still"
+    return "✅ Good — capturing"
 
 
 # ================= LOGIN =================
@@ -288,23 +241,22 @@ def page_attendance():
 
 
 def _run_recognition(frame_bgr, enc: dict, tolerance: float):
-    """Common recognition path for live + scan-now. Returns (annotated_rgb,
-    results, inv) with boxes in WORK coords (scale by inv for display)."""
+    """Shared recognition path. Returns (annotated_rgb, results, inv) —
+    boxes are in WORK coords; multiply by inv for original-image coords."""
     rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     work, inv = to_working(rgb)
-    results = recognize(work, enc, tolerance=tolerance, scale=0.5,
+    results = recognize(work, enc, tolerance=tolerance, scale=1.0,
                         prob_threshold=LIVE_PROB)
     vis = cv2.cvtColor(annotate(cv2.cvtColor(work, cv2.COLOR_RGB2BGR), results),
                        cv2.COLOR_BGR2RGB)
     return vis, results, inv
 
 
-def _apply_marks(results, inv, cid: str, sess: dict, tolerance_unused=None):
-    """Mark known faces, update session log, return list of new names."""
+def _apply_marks(results, cid: str, sess: dict):
+    """Mark known faces, update the session log. Returns new names."""
     status = store.status_now(classes[cid].get("late_after"))
     new_marks, any_unknown = [], False
-    for box_t, label, known, dist in results:
-        # box is (t, r, b, l) in WORK coords — scale to full for thumbs if needed
+    for box, label, known, dist in results:
         if known:
             nm = people.get(label, {}).get("name", label)
             if store.mark(label, nm, status, cid):
@@ -320,108 +272,68 @@ def _apply_marks(results, inv, cid: str, sess: dict, tolerance_unused=None):
 
 
 def _live_session(cid: str, cls: dict, enc: dict, tolerance: float):
-    """Hands-free mode with diagnostics. Dumb callback stores frames; one
-    fragment recognizes every N seconds; Scan-now button is a guaranteed path."""
+    """Browser-capture loop: the component opens the camera, pushes a frame
+    every N seconds; each new frame triggers detect → mark → repeat."""
     key = f"session::{cid}"
-    sess = st.session_state.setdefault(key, {"log": [], "last_i": -1,
-                                             "unknown": 0, "err": None,
-                                             "first_seen": None, "vis": None})
+    sess = st.session_state.setdefault(key, {"log": [], "last_seq": 0,
+                                             "unknown": 0, "vis": None})
+    if not enc:
+        st.warning("Nobody on this roster has face data yet — enroll first.")
+        return
+    interval = st.select_slider("Capture interval", options=[3, 5, 8], value=5,
+                                format_func=lambda v: f"{v}s")
+    st.caption(f"Camera opens in your browser · captures every **{interval}s** → "
+               f"detect → mark → repeat · auto-marking as "
+               f"**{store.status_now(cls.get('late_after'))}** · "
+               f"{len(enc)} face(s) on roster · first scan warms the model "
+               "(~30–60s once per reboot)")
+
     left, right = st.columns([5, 4])
 
     with left:
-        if not enc:
-            st.warning("Nobody on this roster has face data yet — enroll first.")
-        interval = st.select_slider("Scan interval", options=[2, 3, 5], value=3,
-                                    format_func=lambda v: f"{v}s")
-        _webrtc(f"cam::{cid}")
-
-        # -- diagnostics fragment: connection status + suggestions --
-        @st.fragment(run_every=1.0)
-        def _diag():
-            with _CAM["lock"]:
-                i = _CAM["i"]
-            if sess["first_seen"] is None and i > 0:
-                sess["first_seen"] = time.time()
-            if i == 0:
-                waited = int(time.time() - st.session_state.get("sess_t0", time.time()))
-                st.warning(f"🔴 Camera not connected to the server ({waited}s). "
-                           "If this persists: check the permission pop-up, try Chrome, "
-                           "disable VPN — some networks block WebRTC.")
-                if waited > 20:
-                    if st.button("📷 Switch to Single photo mode", type="primary"):
-                        st.session_state["scan_mode"] = "📷 Single photo"
-                        st.session_state.pop(key, None)
-                        st.rerun()
-            else:
-                st.caption(f"🟢 Connected — frames received: **{i}**")
-
-        if "sess_t0" not in st.session_state:
-            st.session_state["sess_t0"] = time.time()
-        _diag()
-
-        st.caption(f"Auto-marking as **{store.status_now(cls.get('late_after'))}** · "
-                   f"{len(enc)} face(s) on roster · first scan warms up the model "
-                   "(~30–60s once per reboot)")
-
-        # -- recognition fragment --
-        @st.fragment(run_every=float(interval))
-        def _worker():
-            with _CAM["lock"]:
-                frame, i = _CAM["frame"], _CAM["i"]
-            if frame is None or not enc:
+        @st.fragment
+        def _live():
+            val = _autocam(interval=interval, facing="user",
+                           key=f"autocam::{cid}", height=430)
+            if val is None:
+                st.info("Starting camera… allow the permission pop-up (once).")
                 return
-            if i - sess["last_i"] < 5:          # no new frames since last scan
+            if val.get("error"):
+                st.error(f"Camera error: {val['error']}")
+                st.info("If the camera is blocked inside the page, use "
+                        "**📷 Single photo** mode — same permission path, "
+                        "always works.")
                 return
-            sess["last_i"] = i
+            if int(val.get("seq", 0)) == sess["last_seq"]:
+                if sess["vis"] is not None:
+                    st.image(sess["vis"], width="stretch")
+                return
+            sess["last_seq"] = int(val["seq"])
+            buf = base64.b64decode(val["frame"].split(",", 1)[1])
+            frame = cv2.imdecode(np.frombuffer(buf, np.uint8), cv2.IMREAD_COLOR)
             try:
                 vis, results, inv = _run_recognition(frame, enc, tolerance)
-                sess["err"] = None
             except Exception as e:
-                sess["err"] = str(e)[:180]
+                st.error(f"Recognition error: {str(e)[:180]}")
                 return
             sess["vis"] = vis
-            gray = cv2.cvtColor(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
-                                cv2.COLOR_RGB2GRAY)
-            n_faces = len(results)
-            sharp = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-            suggestion_box(live_suggestion(n_faces, float(gray.mean()), sharp))
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            suggestion_box(live_suggestion(
+                len(results), float(gray.mean()),
+                float(cv2.Laplacian(gray, cv2.CV_64F).var())))
             st.image(vis, width="stretch")
-            new_marks = _apply_marks(results, inv, cid, sess)
+            new_marks = _apply_marks(results, cid, sess)
             if new_marks:
                 st.toast(f"{', '.join(new_marks)} — marked", icon="🪪")
 
-        _worker()
-        if sess["vis"] is not None and sess["err"] is None:
-            st.image(sess["vis"], width="stretch")   # last annotated frame (persists)
-
-        if st.button("📸 Scan now", width="stretch",
-                     disabled=not enc, help="Guaranteed one-shot scan of the "
-                     "current camera frame"):
-            with _CAM["lock"]:
-                frame = _CAM["frame"]
-            if frame is None:
-                st.error("No camera frame available yet.")
-            else:
-                with st.spinner("Scanning…"):
-                    vis, results, inv = _run_recognition(frame, enc, tolerance)
-                sess["vis"] = vis
-                st.image(vis, width="stretch")
-                new_marks = _apply_marks(results, inv, cid, sess)
-                if new_marks:
-                    st.toast(f"{', '.join(new_marks)} — marked", icon="🪪")
-                if not results:
-                    st.info("No faces detected in the current frame.")
-                st.rerun()
+        _live()
 
     with right:
         st.markdown("**Session log**")
         c1, c2, c3 = st.columns(3)
         c1.metric("Marked", len(sess["log"]))
         c2.metric("Unknown", sess["unknown"])
-        with _CAM["lock"]:
-            c3.metric("Frames seen", _CAM["i"])
-        if sess["err"]:
-            st.error(f"Recognition error: {sess['err']}")
+        c3.metric("Captures", sess["last_seq"])       # must climb every interval
         if sess["log"]:
             st.dataframe(pd.DataFrame(sess["log"]), hide_index=True, width="stretch")
         else:
@@ -455,30 +367,29 @@ def _single_photo(cid: str, cls: dict, enc: dict, tolerance: float):
         st.caption(f"Roster **{len(cls.get('students', []))}** · face data **{len(enc)}**"
                    + (f" · late after **{cls['late_after']}**" if cls.get("late_after") else ""))
         snap = st.camera_input("Scan the room")
-        results, vis = [], None
+        results, rgb = [], None
         if snap is not None:
             if not enc:
                 st.warning("Nobody on this roster has face data yet — enroll first.")
             else:
                 rgb = to_rgb(snap)
                 with st.spinner("Recognizing…"):
-                    vis, results, _ = _run_recognition(rgb, enc, tolerance)
-                st.session_state["_last_rgb"] = rgb
+                    vis, results, inv = _run_recognition(rgb, enc, tolerance)
                 st.image(vis, width="stretch")
         if st.button("🚫 End class — mark remaining absent", width="stretch"):
             confirm_end_class(cid)
     with right:
         st.markdown("**Results**")
-        if snap is not None and not results and enc:
+        if snap is not None and not results and rgb is not None:
             empty_state("😶", "No faces detected", "Move closer / improve lighting.")
         status = store.status_now(cls.get("late_after"))
         fresh = 0
         for box, label, known, dist in results:
-            rgb = st.session_state.get("_last_rgb")
             with st.container(border=True):
                 c1, c2 = st.columns([1, 3])
                 if rgb is not None:
-                    c1.image(face_thumb(rgb, box), width="stretch")
+                    t, r, b, l = [int(v * inv) for v in box]   # work → original
+                    c1.image(face_thumb(rgb, (t, r, b, l)), width="stretch")
                 if known:
                     nm = people.get(label, {}).get("name", label)
                     is_new = store.mark(label, nm, status, cid)
@@ -858,5 +769,5 @@ with st.sidebar:
     if st.button("Log out", width="stretch"):
         st.session_state.clear()
         st.rerun()
-    st.caption("v2.5 · self-hosted · data stays local")
+    st.caption("v2.6 · self-hosted · data stays local")
 pg.run()
