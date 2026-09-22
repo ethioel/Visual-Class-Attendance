@@ -24,11 +24,10 @@ def _get_backend():
 
 
 def detect_and_encode(rgb, scale: float = 1.0, model: str = "facenet",
-                      num_jitters: int = 1):
+                      num_jitters: int = 1, prob_threshold: float = 0.90):
     """Detect + encode. Returns ((top,right,bottom,left) boxes in ORIGINAL scale,
     512-d L2-normalized embeddings). num_jitters>1 adds horizontal-flip TTA.
-    Faces are cropped manually (box → resize 160×160 → (x-127.5)/128), mirroring
-    facenet-pytorch's official manual-crop pipeline. Deliberately avoids
+    Manual crop (box → resize 160×160 → (x-127.5)/128) — deliberately avoids
     MTCNN.extract(), whose signature differs between library versions."""
     import cv2
     import torch
@@ -39,7 +38,7 @@ def detect_and_encode(rgb, scale: float = 1.0, model: str = "facenet",
     if boxes is None:
         return [], []
     cands = [b for b, p in zip(boxes, probs)
-             if b is not None and p is not None and p >= 0.90]
+             if b is not None and p is not None and p >= prob_threshold]
     if not cands:
         return [], []
 
@@ -94,8 +93,10 @@ def best_match(encoding, encodings_db: Dict[str, list],
 
 
 def recognize(rgb, encodings_db, tolerance: float = 1.0, scale: float = 0.5,
-              model: str = "facenet") -> List[Recognition]:
-    locs, encs = detect_and_encode(rgb, scale=scale, model=model)
+              model: str = "facenet",
+              prob_threshold: float = 0.90) -> List[Recognition]:
+    locs, encs = detect_and_encode(rgb, scale=scale, model=model,
+                                   prob_threshold=prob_threshold)
     out: List[Recognition] = []
     for box, enc in zip(locs, encs):
         pid, dist = best_match(enc, encodings_db, tolerance=tolerance)
