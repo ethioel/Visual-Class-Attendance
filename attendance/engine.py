@@ -7,30 +7,67 @@ import numpy as np
 Face = Tuple[int, int, int, int]                 # (top, right, bottom, left), source scale
 Recognition = Tuple[Face, str, bool, float]      # box, label, is_known, distance
 
+_BACKEND = None  # lazy singleton: (mtcnn, resnet, torch)
 
-def detect_and_encode(rgb, scale: float = 1.0, model: str = "hog", num_jitters: int = 1):
-    """Detect + encode. num_jitters>1 averages perturbed crops (slower, more stable).
-    Coordinates are returned in the ORIGINAL image scale."""
+
+def _get_backend():
+    """MTCNN detector + InceptionResnetV1 (VGGFace2, 512-d) on CPU.
+    Weights (~100 MB) download on first use, cached per runtime.
+    Lazy import → tests/CI never touch torch."""
+    global _BACKEND
+    if _BACKEND is None:
+        import torch
+        from facenet_pytorch import InceptionResnetV1, MTCNN
+        mtcnn = MTCNN(image_size=160, margin=0, keep_all=True, device="cpu")
+        resnet = InceptionResnetV1(pretrained="vggface2").eval()
+        _BACKEND = (mtcnn, resnet, torch)
+    return _BACKEND
+
+
+def detect_and_encode(rgb, scale: float = 1.0, model: str = "facenet",
+                      num_jitters: int = 1):
+    """Detect + encode. Returns ((top,right,bottom,left) boxes in ORIGINAL scale,
+    512-d L2-normalized embeddings). num_jitters>1 adds horizontal-flip TTA
+    (embedding = mean of both views). `model` kept for API compatibility."""
     import cv2
-    import face_recognition  # lazy: keeps tests and CI dlib-free
+    mtcnn, resnet, torch = _get_backend()
 
     work = rgb if scale >= 1.0 else cv2.resize(rgb, None, fx=scale, fy=scale)
-    locs = face_recognition.face_locations(work, model=model)
-    encs = face_recognition.face_encodings(work, locs, num_jitters=num_jitters)
-    if scale != 1.0:
-        inv = 1.0 / scale
-        locs = [(int(t * inv), int(r * inv), int(b * inv), int(l * inv)) for t, r, b, l in locs]
-    return locs, encs
+    boxes, probs = mtcnn.detect(work)
+    if boxes is None:
+        return [], []
+
+    ok = [i for i, (b, p) in enumerate(zip(boxes, probs))
+          if b is not None and p is not None and p >= 0.90]
+    if not ok:
+        return [], []
+    boxes = np.stack([boxes[i] for i in ok])
+
+    with torch.no_grad():
+        faces = mtcnn.extract(work, boxes)              # aligned (N,3,160,160)
+        emb = resnet(faces)
+        if num_jitters > 1:                             # cheap TTA
+            emb = emb + resnet(torch.flip(faces, dims=(3,)))
+        emb = torch.nn.functional.normalize(emb, dim=1)
+
+    inv = 1.0 / scale if scale < 1.0 else 1.0
+    locs = [(int(y1 * inv), int(x2 * inv), int(y2 * inv), int(x1 * inv))
+            for (x1, y1, x2, y2) in boxes]
+    return locs, list(emb.cpu().numpy())
 
 
-def best_match(encoding: np.ndarray, encodings_db: Dict[str, List[np.ndarray]],
-               tolerance: float = 0.55, top_k: int = 3) -> Tuple[Optional[str], float]:
-    """Mean of the k closest samples per person — one lucky sample can't fake a
-    match, one bad sample can't break one. Pure NumPy → testable without dlib."""
-    best_pid, best_score = None, float("inf")
+def best_match(encoding, encodings_db: Dict[str, list],
+               tolerance: float = 1.0, top_k: int = 3) -> Tuple[Optional[str], float]:
+    """Mean of the k closest samples per person. Skips samples with a different
+    dimension (e.g. legacy dlib 128-d vectors) so mixed databases never crash."""
     target = np.asarray(encoding, dtype=np.float32)
+    best_pid, best_score = None, float("inf")
     for pid, samples in encodings_db.items():
-        mat = np.asarray(samples, dtype=np.float32)
+        mats = [np.asarray(s, dtype=np.float32) for s in samples
+                if np.asarray(s).shape == target.shape]
+        if not mats:
+            continue
+        mat = np.stack(mats)
         d = np.linalg.norm(mat - target, axis=1)
         score = float(np.sort(d)[: min(top_k, d.size)].mean())
         if score < best_score:
@@ -40,13 +77,14 @@ def best_match(encoding: np.ndarray, encodings_db: Dict[str, List[np.ndarray]],
     return None, best_score
 
 
-def recognize(rgb, encodings_db, tolerance: float = 0.55, scale: float = 0.5,
-              model: str = "hog") -> List[Recognition]:
+def recognize(rgb, encodings_db, tolerance: float = 1.0, scale: float = 0.5,
+              model: str = "facenet") -> List[Recognition]:
     locs, encs = detect_and_encode(rgb, scale=scale, model=model)
     out: List[Recognition] = []
     for box, enc in zip(locs, encs):
         pid, dist = best_match(enc, encodings_db, tolerance=tolerance)
-        out.append((box, pid, True, dist) if pid else (box, f"Unknown ({dist:.2f})", False, dist))
+        out.append((box, pid, True, dist) if pid
+                   else (box, f"Unknown ({dist:.2f})", False, dist))
     return out
 
 
