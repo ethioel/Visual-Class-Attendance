@@ -1,5 +1,5 @@
+import logging
 import os
-import re
 import threading
 import time
 from io import BytesIO
@@ -16,6 +16,16 @@ try:
 except Exception:
     pass
 
+
+class _IceRetryNoise(logging.Filter):
+    """Silence aioice STUN retry tracebacks (dead transport after widget teardown)."""
+    def filter(self, record):
+        msg = record.getMessage()
+        return "Transaction.__retry" not in msg and "sendto" not in msg
+
+
+logging.getLogger("asyncio").addFilter(_IceRetryNoise())
+
 from attendance.auth import Auth
 from attendance.config import Config
 from attendance.engine import (_get_backend, annotate, detect_and_encode,
@@ -30,7 +40,7 @@ st.set_page_config(page_title="Visual Attendance", page_icon="🪪", layout="wid
 
 MAIN_DB = os.environ.get("ATT_DB_DIR", "attendance_db")
 GUEST_DB = "demo_db"
-STATUS_OPTS = ["—", "Present", "Late", "Absent"]
+STATUS_OPTS = ["—", "Present", "Late", "Excused", "Absent"]
 
 
 @st.cache_resource
@@ -57,29 +67,34 @@ _CAM = {"lock": threading.Lock(), "frame": None, "m": {}, "i": 0}
 
 
 def _on_frame(frame):
-    """aiortc thread: keep latest frame + quality metrics (cheap, every 3rd frame)."""
-    img = frame.to_ndarray(format="bgr24")
-    with _CAM["lock"]:
-        _CAM["frame"] = img
-        _CAM["i"] += 1
-        skip = _CAM["i"] % 3
-    if skip:
-        return frame
-    small = cv2.resize(img, None, fx=0.5, fy=0.5)
-    rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
-    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-    m = {"brightness": float(gray.mean()),
-         "sharpness": float(cv2.Laplacian(gray, cv2.CV_64F).var()),
-         "boxes": None, "shape": rgb.shape}
+    """aiortc thread: keep latest frame + quality metrics (cheap, every 3rd frame).
+    Boxes are stored in FULL-FRAME coordinates for direct preview drawing."""
     try:
-        mtcnn, _, _ = _get_backend()
-        boxes, probs = mtcnn.detect(rgb)
-        m["boxes"] = [b for b, p in zip(boxes or [], probs or [])
-                      if b is not None and p is not None and p >= 0.90]
+        img = frame.to_ndarray(format="bgr24")
+        with _CAM["lock"]:
+            _CAM["frame"] = img
+            _CAM["i"] += 1
+            skip = _CAM["i"] % 3
+        if skip:
+            return frame
+        small = cv2.resize(img, None, fx=0.5, fy=0.5)
+        rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        m = {"brightness": float(gray.mean()),
+             "sharpness": float(cv2.Laplacian(gray, cv2.CV_64F).var()),
+             "boxes": [], "shape": img.shape}
+        try:
+            mtcnn, _, _ = _get_backend()
+            boxes, probs = mtcnn.detect(rgb)
+            m["boxes"] = [(np.asarray(b) * 2).tolist()
+                          for b, p in zip(boxes or [], probs or [])
+                          if b is not None and p is not None and p >= 0.90]
+        except Exception:
+            pass
+        with _CAM["lock"]:
+            _CAM["m"] = m
     except Exception:
         pass
-    with _CAM["lock"]:
-        _CAM["m"] = m
     return frame
 
 
@@ -114,13 +129,22 @@ def live_suggestion(m: dict) -> str:
         msgs.append("🌤️ Too bright — avoid direct light")
     if m.get("sharpness", 100) < 35:
         msgs.append("📸 Hold still — blurry")
-    return " · ".join(msgs) if msgs else "✅ Perfect — hold still, capturing…"
+    return " · ".join(msgs) if msgs else "✅ Perfect — hold still"
+
+
+_ICE = {"iceServers": [
+    {"urls": "stun:stun.l.google.com:19302"},
+    {"urls": "turn:openrelay.metered.ca:80",
+     "username": "openrelayproject", "credential": "openrelayproject"},
+    {"urls": "turn:openrelay.metered.ca:443?transport=tcp",
+     "username": "openrelayproject", "credential": "openrelayproject"},
+]}
 
 
 def _webrtc():
     from streamlit_webrtc import webrtc_streamer
     webrtc_streamer(key="livecam", video_frame_callback=_on_frame,
-                    rtc_configuration={"iceServers": [{"urls": "stun:stun.l.google.com:19302"}]},
+                    rtc_configuration=_ICE,
                     media_stream_constraints={"video": {"width": {"ideal": 1280},
                                                         "height": {"ideal": 720},
                                                         "facingMode": "user"},
@@ -129,67 +153,27 @@ def _webrtc():
 
 
 def capture_section(pid: str, name: str, store: Store, cfg: Config):
-    """Reusable capture widget (live auto-capture + manual) for one student."""
+    """Manual capture widget (snapshots) for one student — used in Enroll."""
     cap = st.session_state.setdefault(f"cap::{pid}", {"samples": [], "thumbs": []})
-    mode = st.radio("Capture mode", ["🎥 Live auto-capture", "📷 Manual snapshots"],
-                    horizontal=True, key=f"mode::{pid}")
     left, right = st.columns([3, 2])
-
-    if mode.startswith("🎥"):
-        with left:
-            _webrtc()
-
-        @st.fragment(run_every="0.8s")
-        def _live():
-            with _CAM["lock"]:
-                m, frame = dict(_CAM["m"]), _CAM["frame"]
-            sugg = live_suggestion(m)
-            suggestion_box(sugg)
-            n = len(cap["samples"])
-            st.progress(min(n / cfg.n_samples, 1.0), text=f"{n}/{cfg.n_samples} samples")
-            good = sugg.startswith("✅")
-            k = f"streak::{pid}"
-            st.session_state[k] = st.session_state.get(k, 0) + 1 if good else 0
-            if (good and n < cfg.n_samples and st.session_state[k] >= 2
-                    and time.time() - st.session_state.get(f"lastcap::{pid}", 0) > 2.0
-                    and frame is not None):
-                locs, encs = detect_and_encode(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
-                                               scale=1.0, num_jitters=cfg.enroll_jitters)
-                box = largest_face(locs)
-                if box is not None:
-                    cap["samples"].append(encs[locs.index(box)])
-                    cap["thumbs"].append(face_thumb(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
-                                                    box, 72))
-                    st.session_state[f"lastcap::{pid}"] = time.time()
-                    st.session_state[k] = 0
-            th = st.columns(5)
-            for i, t in enumerate(cap["thumbs"]):
-                th[i % 5].image(t, width="stretch")
-            if len(cap["samples"]) >= cfg.n_samples:
-                st.success("All samples captured — review & save below.")
-
-        with right:
-            _live()
-    else:
-        with left:
-            shot = st.camera_input("Capture a sample — vary angle & lighting",
-                                   key=f"man::{pid}::{len(cap['samples'])}")
-            if shot is not None:
-                rgb = to_rgb(shot)
-                locs, encs = detect_and_encode(rgb, scale=1.0,
-                                               num_jitters=cfg.enroll_jitters)
-                box = largest_face(locs)
-                if box is None:
-                    st.error("No face detected — improve lighting and retake.")
-                else:
-                    cap["samples"].append(encs[locs.index(box)])
-                    cap["thumbs"].append(face_thumb(rgb, box, 72))
-                    st.rerun()
-        with right:
-            th = st.columns(5)
-            for i, t in enumerate(cap["thumbs"]):
-                th[i % 5].image(t, width="stretch")
-
+    with left:
+        shot = st.camera_input("Capture a sample — vary angle & lighting",
+                               key=f"man::{pid}::{len(cap['samples'])}")
+        if shot is not None:
+            rgb = to_rgb(shot)
+            locs, encs = detect_and_encode(rgb, scale=1.0,
+                                           num_jitters=cfg.enroll_jitters)
+            box = largest_face(locs)
+            if box is None:
+                st.error("No face detected — improve lighting and retake.")
+            else:
+                cap["samples"].append(encs[locs.index(box)])
+                cap["thumbs"].append(face_thumb(rgb, box, 72))
+                st.rerun()
+    with right:
+        th = st.columns(5)
+        for i, t in enumerate(cap["thumbs"]):
+            th[i % 5].image(t, width="stretch")
     if cap["samples"]:
         if st.button(f"💾 Save {len(cap['samples'])} sample(s) for {name or pid}",
                      type="primary", width="stretch"):
@@ -249,7 +233,7 @@ def scope_records() -> pd.DataFrame:
 def rate_table(cid: str) -> pd.DataFrame:
     r = store.attendance_rates(cid)
     if not r.empty:
-        r["Rate"] = pd.to_numeric(r["Rate"].astype(str).str.rstrip("%"))
+        r["Rate"] = pd.to_numeric(r["Rate"].astype(str).str.rstrip("%"), errors="coerce")
     return r
 
 
@@ -300,7 +284,7 @@ def page_dashboard():
             m = p.reset_index().melt("Date", var_name="Status", value_name="Students")
             colors = {"Present": "#16A34A", "Late": "#F59E0B", "Absent": "#EF4444"}
             domain = [s for s in ["Present", "Late", "Absent"] if s in m.Status.unique()]
-            chart = (alt.Chart(m).mark_bar(cornerRadius=3)          # ← fixed
+            chart = (alt.Chart(m).mark_bar(cornerRadius=3)
                      .encode(x=alt.X("Date:O", axis=alt.Axis(labelAngle=-40, title=None,
                                                              labelColor="#64748B")),
                              y=alt.Y("Students:Q", axis=alt.Axis(title=None,
@@ -323,68 +307,18 @@ def page_attendance():
     cid = st.selectbox("Class", list(classes),
                        format_func=lambda c: f"{classes[c]['name']} · {c}")
     cls = classes[cid]
-    left, right = st.columns([5, 4])
-    with left:
-        with st.popover("⚙️ Scan settings"):
-            tolerance = st.slider("Match tolerance (lower = stricter)", 0.60, 1.40,
-                                  cfg.tolerance, 0.01)
-        enc = {p: enc_all[p] for p in cls.get("students", []) if p in enc_all}
-        st.caption(f"Roster **{len(cls.get('students', []))}** · face data **{len(enc)}**"
-                   + (f" · late after **{cls['late_after']}**" if cls.get("late_after") else ""))
-        snap = st.camera_input("Scan the room (phone rear camera works)")
-        results = []
-        if snap is not None:
-            if not enc:
-                st.warning("Nobody on this roster has face data yet — enroll first.")
-            else:
-                rgb = to_rgb(snap)
-                with st.spinner("Recognizing…"):
-                    results = recognize(rgb, enc, tolerance=tolerance,
-                                        scale=cfg.detect_scale)
-                st.session_state["_last_rgb"] = rgb
-                bgr = annotate(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), results)
-                st.image(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), width="stretch")
-        if st.button("🚫 End class — mark remaining absent", width="stretch"):
-            confirm_end_class(cid)
-    with right:
-        st.markdown("**Results**")
-        if snap is not None and not results and enc:
-            empty_state("😶", "No faces detected", "Move closer / improve lighting.")
-        status = store.status_now(cls.get("late_after"))
-        fresh, unknowns = 0, []
-        for box, label, known, dist in results:
-            rgb = st.session_state.get("_last_rgb")
-            with st.container(border=True):
-                c1, c2 = st.columns([1, 3])
-                if rgb is not None:
-                    c1.image(face_thumb(rgb, box), width="stretch")
-                if known:
-                    nm = people.get(label, {}).get("name", label)
-                    is_new = store.mark(label, nm, status, cid)
-                    fresh += is_new
-                    c2.markdown(f"**{nm}**  \n`{label}` · score {dist:.2f}")
-                    c2.markdown(f"<span class='pill pill-{status.lower()}'>{status}</span>"
-                                + (" <span class='pill pill-muted'>NEW</span>" if is_new else ""),
-                                unsafe_allow_html=True)
-                else:
-                    unknowns.append((box, dist))
-                    c2.markdown(f"**Unknown face**  \nscore {dist:.2f} — not on this roster")
-        if fresh:
-            st.toast(f"{fresh} new mark(s) in {cls['name']}", icon="🪪")
+    enc = {p: enc_all[p] for p in cls.get("students", []) if p in enc_all}
+    tolerance = st.slider("Match tolerance (lower = stricter)", 0.60, 1.40,
+                          cfg.tolerance, 0.01)
+    mode = st.radio("Scan mode", ["🎥 Live auto-scan (hands-free)", "📷 Single photo"],
+                    horizontal=True)
 
-        # unknown → enroll suggestion
-        if unknowns and st.session_state.get("_last_rgb") is not None:
-            with st.container(border=True):
-                st.warning(f"{len(unknowns)} unknown face(s) — not enrolled or not on this roster.")
-                rgb = st.session_state["_last_rgb"]
-                c1, c2 = st.columns(2)
-                if c1.button("➕ Enroll as new student"):
-                    st.session_state["prefill_thumb"] = face_thumb(rgb, unknowns[0][0], 140)
-                    st.switch_page(PAGES["Enroll student"])
-                if c2.button("🏫 Add existing student to class"):
-                    st.switch_page(PAGES["Classes" if user["role"] == "admin" else "My classes"])
+    if mode.startswith("🎥"):
+        _live_session(cid, cls, enc, tolerance)
+    else:
+        _single_photo(cid, cls, enc, tolerance)
 
-    # ---- editable statuses ----
+    # ---- editable statuses (incl. Excused) ----
     st.divider()
     st.markdown("**✏️ Today's statuses — edit manually**")
     t = store.today_df(cid)
@@ -411,26 +345,155 @@ def page_attendance():
             st.rerun()
 
 
+def _live_session(cid: str, cls: dict, enc: dict, tolerance: float):
+    """Hands-free: webrtc runs continuously; a fragment recognizes the latest
+    frame every ~2.5s and auto-marks known faces. A faster fragment shows a
+    live preview + setup suggestions."""
+    key = f"session::{cid}"
+    sess = st.session_state.setdefault(key, {"log": [], "last_i": -1, "unknown": 0})
+    left, right = st.columns([5, 4])
+
+    with left:
+        if not enc:
+            st.warning("Nobody on this roster has face data yet — enroll first.")
+
+        @st.fragment(run_every=1.0)
+        def _preview():
+            with _CAM["lock"]:
+                m, frame = dict(_CAM["m"]), _CAM["frame"]
+            suggestion_box(live_suggestion(m))
+            if frame is None:
+                empty_state("🎥", "Waiting for camera…",
+                            "Allow camera access — recognition starts automatically.")
+                return
+            vis = frame.copy()
+            for b in (m.get("boxes") or []):
+                x1, y1, x2, y2 = [int(v) for v in b]
+                cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 200, 0), 2)
+            st.image(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB), width="stretch")
+
+        _webrtc()
+        status = store.status_now(cls.get("late_after"))
+        st.caption(f"Auto-marking as **{status}** · {len(enc)} face(s) on roster · "
+                   "scans ~every 2.5s — just walk through the frame")
+        _preview()
+
+    with right:
+        st.markdown("**Session log**")
+
+        @st.fragment(run_every=2.5)
+        def _loop():
+            with _CAM["lock"]:
+                frame, i = _CAM["frame"], _CAM["i"]
+            if frame is None or i == sess["last_i"] or not enc:
+                return
+            if i - sess["last_i"] < 5:          # ignore stale frames
+                return
+            sess["last_i"] = i
+            try:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                results = recognize(rgb, enc, tolerance=tolerance,
+                                    scale=cfg.detect_scale)
+            except Exception:
+                return
+            status = store.status_now(cls.get("late_after"))
+            new_marks, any_unknown = [], False
+            for box, label, known, dist in results:
+                if known:
+                    nm = people.get(label, {}).get("name", label)
+                    if store.mark(label, nm, status, cid):
+                        new_marks.append(nm)
+                    if not any(r for r in sess["log"] if r["ID"] == label):
+                        sess["log"].insert(0, {"Name": nm, "ID": label,
+                                               "Status": STATUS_EMOJI.get(status, status),
+                                               "Score": round(dist, 2)})
+                else:
+                    any_unknown = True
+            sess["unknown"] += int(any_unknown)
+            if new_marks:
+                st.toast(f"{', '.join(new_marks)} — marked", icon="🪪")
+
+        _loop()
+        lg = sess["log"]
+        c1, c2 = st.columns(2)
+        c1.metric("Marked this session", len(lg))
+        c2.metric("Unknown glimpses", sess["unknown"])
+        if lg:
+            st.dataframe(pd.DataFrame(lg), hide_index=True, width="stretch")
+        else:
+            st.caption("Recognized students will appear here automatically.")
+        if sess["unknown"] >= 3:
+            st.warning("Repeated unknown faces — enroll them or add them to this class "
+                       "(➕ Enroll / 👥 Students).")
+        if st.button("⏹️ End session", width="stretch"):
+            confirm_end_class(cid, key)
+
+
 @st.dialog("End this class?")
-def confirm_end_class(cid: str):
+def confirm_end_class(cid: str, sess_key: str = None):
     st.write(f"Everyone in **{classes[cid]['name']}** without a record will be marked "
-             "**Absent**. This can't be undone.")
+             "**Absent**. Students marked **Excused** keep their status.")
     c1, c2 = st.columns(2)
     if c1.button("Cancel", width="stretch"):
         st.rerun()
     if c2.button("Mark absent", type="primary", width="stretch"):
         n = store.mark_absent_all(cid)
+        if sess_key:
+            st.session_state.pop(sess_key, None)
         flash("success", f"{n} student(s) marked Absent in {classes[cid]['name']}.")
         st.rerun()
 
 
-# ================= ENROLL (single) =================
+def _single_photo(cid: str, cls: dict, enc: dict, tolerance: float):
+    """One-shot flow — fallback, and the phone rear-camera mode."""
+    left, right = st.columns([5, 4])
+    with left:
+        st.caption(f"Roster **{len(cls.get('students', []))}** · face data **{len(enc)}**"
+                   + (f" · late after **{cls['late_after']}**" if cls.get("late_after") else ""))
+        snap = st.camera_input("Scan the room")
+        results = []
+        if snap is not None:
+            if not enc:
+                st.warning("Nobody on this roster has face data yet — enroll first.")
+            else:
+                rgb = to_rgb(snap)
+                with st.spinner("Recognizing…"):
+                    results = recognize(rgb, enc, tolerance=tolerance,
+                                        scale=cfg.detect_scale)
+                st.session_state["_last_rgb"] = rgb
+                st.image(cv2.cvtColor(annotate(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
+                                               results), cv2.COLOR_BGR2RGB), width="stretch")
+        if st.button("🚫 End class — mark remaining absent", width="stretch"):
+            confirm_end_class(cid)
+    with right:
+        st.markdown("**Results**")
+        if snap is not None and not results and enc:
+            empty_state("😶", "No faces detected", "Move closer / improve lighting.")
+        status = store.status_now(cls.get("late_after"))
+        fresh = 0
+        for box, label, known, dist in results:
+            rgb = st.session_state.get("_last_rgb")
+            with st.container(border=True):
+                c1, c2 = st.columns([1, 3])
+                if rgb is not None:
+                    c1.image(face_thumb(rgb, box), width="stretch")
+                if known:
+                    nm = people.get(label, {}).get("name", label)
+                    is_new = store.mark(label, nm, status, cid)
+                    fresh += is_new
+                    c2.markdown(f"**{nm}**  \n`{label}` · score {dist:.2f}")
+                    c2.markdown(f"<span class='pill pill-{status.lower()}'>{status}</span>"
+                                + (" <span class='pill pill-muted'>NEW</span>" if is_new else ""),
+                                unsafe_allow_html=True)
+                else:
+                    c2.markdown(f"**Unknown face**  \nscore {dist:.2f} — not on this roster")
+        if fresh:
+            st.toast(f"{fresh} new mark(s) in {cls['name']}", icon="🪪")
+
+
+# ================= ENROLL (single, manual capture) =================
 def page_enroll():
     section("➕", "Enroll student")
-    prefill = st.session_state.pop("prefill_thumb", None)
-    if prefill is not None:
-        st.info("This photo came from an attendance scan — enroll this person:")
-        st.image(prefill, width=140)
     c1, c2, c3 = st.columns(3)
     id_mode = c1.radio("ID mode", ["🤖 Automatic", "✍️ Custom"], horizontal=True)
     nxt = f"STU-{len(people) + 1:03d}"
@@ -451,9 +514,9 @@ def page_enroll():
     capture_section(pid.strip(), name.strip(), store, cfg)
 
 
-# ================= STUDENTS (batch + edit) =================
+# ================= STUDENTS (batch + edit + pending photos) =================
 def parse_roster(df: pd.DataFrame) -> pd.DataFrame:
-    cols = {re.sub(r"[^a-z0-9]", "", str(c).lower()): c for c in df.columns}
+    cols = {"".join(ch for ch in str(c).lower() if ch.isalnum()): c for c in df.columns}
     name_col = next((o for n, o in cols.items() if "name" in n), None)
     id_col = next((o for n, o in cols.items()
                    if n in ("id", "studentid", "sid", "roll", "rollno", "no", "number")
@@ -518,7 +581,6 @@ def page_students():
                    "imported from file or saved without photos.")
         pick = st.selectbox("Student", list(pending),
                             format_func=lambda p: f"{pending[p].get('name', p)} · {p}")
-        st.info("📷 Capture live samples or upload existing photos for this student.")
         ups = st.file_uploader("Upload photo files (JPG/PNG — one face per photo)",
                                type=["jpg", "jpeg", "png"], accept_multiple_files=True,
                                key=f"up::{pick}")
@@ -607,6 +669,7 @@ def class_card(cid: str, cls: dict, show_teacher: bool):
             if r.empty:
                 st.caption("No sessions recorded yet.")
             else:
+                r = r.dropna(subset=["Rate"])
                 st.dataframe(r, hide_index=True, width="stretch",
                              column_config={"Rate": st.column_config.ProgressColumn(
                                  "Attendance", min_value=0, max_value=100, format="%.0f%%")})
@@ -684,17 +747,18 @@ def page_records():
                        format_func=lambda c: "All classes" if c == "All"
                        else f"{classes[c]['name']}")
     date = f2.selectbox("Date", ["All"] + sorted(df.Date.unique(), reverse=True))
-    statuses = f3.multiselect("Status", ["Present", "Late", "Absent"],
-                              default=["Present", "Late", "Absent"])
+    statuses = f3.multiselect("Status", ["Present", "Late", "Excused", "Absent"],
+                              default=["Present", "Late", "Excused", "Absent"])
     view = df[df.Class == cid] if cid != "All" else df
     if date != "All":
         view = view[view.Date == date]
     view = view[view.Status.isin(statuses)]
-    k = st.columns(4)
+    k = st.columns(5)
     k[0].metric("Records", len(view))
     k[1].metric("Present", (view.Status == "Present").sum())
     k[2].metric("Late", (view.Status == "Late").sum())
-    k[3].metric("Absent", (view.Status == "Absent").sum())
+    k[3].metric("Excused", (view.Status == "Excused").sum())
+    k[4].metric("Absent", (view.Status == "Absent").sum())
     v = view.copy()
     v["Status"] = v.Status.map(lambda s: STATUS_EMOJI.get(s, s))
     st.dataframe(v, hide_index=True, width="stretch")
@@ -709,10 +773,10 @@ def page_records():
                        width="stretch")
     if cid != "All":
         st.markdown("**Attendance rate (all sessions in this class)**")
-        r = rate_table(cid)
+        r = rate_table(cid).dropna(subset=["Rate"])
         if not r.empty:
             r2 = r.sort_values("Rate", ascending=False)
-            chart = (alt.Chart(r2).mark_bar(cornerRadius=4, color="#4F46E5")  # ← fixed
+            chart = (alt.Chart(r2).mark_bar(cornerRadius=4, color="#4F46E5")
                      .encode(x=alt.X("Rate:Q", scale=alt.Scale(domain=[0, 100]), title=None),
                              y=alt.Y("Name:N", sort=r2["Name"].tolist(), title=None),
                              tooltip=["Name", "Rate"])
@@ -737,8 +801,7 @@ def build_nav(role: str):
     return pages
 
 
-PAGES = {p.title: p for p in build_nav(user["role"])}
-pg = st.navigation(list(PAGES.values()))
+pg = st.navigation(build_nav(user["role"]))
 
 with st.sidebar:
     m1, m2 = st.columns(2)
@@ -750,10 +813,7 @@ with st.sidebar:
     with st.popover("⚙️ Settings"):
         from zoneinfo import available_timezones
         tz_list = sorted(t for t in available_timezones() if "/" in t) + ["UTC"]
-        try:
-            cur = cfg.timezone or "UTC"
-        except Exception:
-            cur = "UTC"
+        cur = cfg.timezone or "UTC"
         tz = st.selectbox("Time zone", tz_list,
                           index=tz_list.index(cur) if cur in tz_list else len(tz_list) - 1)
         if tz != cur:
@@ -765,5 +825,5 @@ with st.sidebar:
     if st.button("Log out", width="stretch"):
         st.session_state.clear()
         st.rerun()
-    st.caption("v2.3 · self-hosted · data stays local")
+    st.caption("v2.4 · self-hosted · data stays local")
 pg.run()
