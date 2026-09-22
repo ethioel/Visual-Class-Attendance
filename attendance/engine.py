@@ -23,36 +23,54 @@ def _get_backend():
         _BACKEND = (mtcnn, resnet, torch)
     return _BACKEND
 
-
 def detect_and_encode(rgb, scale: float = 1.0, model: str = "facenet",
                       num_jitters: int = 1):
     """Detect + encode. Returns ((top,right,bottom,left) boxes in ORIGINAL scale,
-    512-d L2-normalized embeddings). num_jitters>1 adds horizontal-flip TTA
-    (embedding = mean of both views). `model` kept for API compatibility."""
+    512-d L2-normalized embeddings). num_jitters>1 adds horizontal-flip TTA.
+    `model` kept for API compatibility.
+
+    Faces are cropped manually (box → resize 160×160 → (x-127.5)/128), mirroring
+    facenet-pytorch's official manual-crop pipeline. Deliberately avoids
+    MTCNN.extract(), whose signature differs between library versions."""
     import cv2
-    mtcnn, resnet, torch = _get_backend()
+    import torch
+    mtcnn, resnet, _ = _get_backend()
 
     work = rgb if scale >= 1.0 else cv2.resize(rgb, None, fx=scale, fy=scale)
     boxes, probs = mtcnn.detect(work)
     if boxes is None:
         return [], []
-
-    ok = [i for i, (b, p) in enumerate(zip(boxes, probs))
-          if b is not None and p is not None and p >= 0.90]
-    if not ok:
+    cands = [b for b, p in zip(boxes, probs)
+             if b is not None and p is not None and p >= 0.90]
+    if not cands:
         return [], []
-    boxes = np.stack([boxes[i] for i in ok])
 
+    h, w = work.shape[:2]
+    kept, faces = [], []
+    for b in cands:
+        x1, y1, x2, y2 = [int(round(v)) for v in b]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w - 1, x2), min(h - 1, y2)
+        if x2 - x1 < 2 or y2 - y1 < 2:
+            continue
+        crop = cv2.resize(work[y1:y2, x1:x2], (160, 160),
+                          interpolation=cv2.INTER_LINEAR)
+        t = torch.from_numpy(np.ascontiguousarray(crop)).permute(2, 0, 1)  # 0–255
+        faces.append((t - 127.5) / 128.0)      # == fixed_image_standardization
+        kept.append((x1, y1, x2, y2))
+    if not faces:
+        return [], []
+
+    batch = torch.stack(faces)
     with torch.no_grad():
-        faces = mtcnn.extract(work, boxes)              # aligned (N,3,160,160)
-        emb = resnet(faces)
-        if num_jitters > 1:                             # cheap TTA
-            emb = emb + resnet(torch.flip(faces, dims=(3,)))
+        emb = resnet(batch)
+        if num_jitters > 1:                    # cheap TTA: mirror view
+            emb = emb + resnet(torch.flip(batch, dims=(3,)))
         emb = torch.nn.functional.normalize(emb, dim=1)
 
     inv = 1.0 / scale if scale < 1.0 else 1.0
     locs = [(int(y1 * inv), int(x2 * inv), int(y2 * inv), int(x1 * inv))
-            for (x1, y1, x2, y2) in boxes]
+            for (x1, y1, x2, y2) in kept]
     return locs, list(emb.cpu().numpy())
 
 
