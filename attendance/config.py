@@ -9,7 +9,7 @@ from typing import Optional
 @dataclass
 class Config:
     db_dir: str = field(default_factory=lambda: os.environ.get("ATT_DB_DIR", "attendance_db"))
-    tolerance: float = field(default_factory=lambda: float(os.environ.get("ATT_TOLERANCE", "0.55")))
+    tolerance: float = field(default_factory=lambda: float(os.environ.get("ATT_TOLERANCE", "1.0")))
     n_samples: int = field(default_factory=lambda: int(os.environ.get("ATT_N_SAMPLES", "6")))
     detect_scale: float = field(default_factory=lambda: float(os.environ.get("ATT_DETECT_SCALE", "0.5")))
     frame_skip: int = field(default_factory=lambda: int(os.environ.get("ATT_FRAME_SKIP", "3")))
