@@ -108,7 +108,7 @@ def page_attendance():
     cls = classes[cid]
     if cls.get("late_after"):
         st.caption(f"Late after **{cls['late_after']}**")
-    tolerance = st.slider("Match tolerance (lower = stricter)", 0.35, 0.70,
+    tolerance = st.slider("Match tolerance (lower = stricter)", 0.60, 1.40,
                           cfg.tolerance, 0.01)
     enc_all = store.load_encodings()
     roster = cls.get("students", [])
