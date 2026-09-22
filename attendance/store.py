@@ -14,6 +14,7 @@ import pandas as pd
 from .config import Config
 
 COLS = ["Date", "Time", "Class", "ID", "Name", "Status"]
+ACTIVE_STATUSES = ("Present", "Late", "Excused")   # any of these blocks auto-marks
 
 
 def _atomic_dump(path: str, mode: str, writer) -> None:
@@ -44,7 +45,7 @@ class Store:
         self._marked: Set[Tuple[str, str, str]] = set()   # (date, class, id)
         df = self._read_csv()
         if not df.empty:
-            done = df[(df.Date == self._today()) & (df.Status.isin(["Present", "Late"]))]
+            done = df[(df.Date == self._today()) & (df.Status.isin(ACTIVE_STATUSES))]
             self._marked = {(self._today(), c, p) for c, p in zip(done.Class, done.ID)}
 
     # ======================= people =======================
@@ -268,7 +269,7 @@ class Store:
     def mark(self, person_id: str, name: str, status: Optional[str] = None,
              class_id: str = "GENERAL") -> bool:
         """Append one record. False if this person already has one today (in
-        this class). Crash-safe: fsync'd append + in-memory + file cross-check."""
+        this class) — including Excused, which auto-marks never overwrite."""
         today, status = self._today(), (status or self.status_now())
         now_t = self.cfg.now().strftime("%H:%M:%S")
         with self._lock:
@@ -297,13 +298,14 @@ class Store:
                    class_id: str = "GENERAL", date: Optional[str] = None) -> bool:
         """Upsert a record with an explicit status (manual editing).
         status=None removes the row (unmarks, so a later scan can re-mark).
+        Excused upserts like Present/Late — only ever set manually.
         Time reflects when the status was last set."""
         date = date or self._today()
         now_t = self.cfg.now().strftime("%H:%M:%S")
         with self._lock:
             df = self._read_csv()
             mask = (df.Date == date) & (df.Class == class_id) & (df.ID == person_id)
-            if status in ("Present", "Late"):
+            if status in ("Present", "Late", "Excused"):
                 if mask.any():
                     df.loc[mask, ["Name", "Status", "Time"]] = [name, status, now_t]
                 else:
@@ -322,10 +324,12 @@ class Store:
         return True
 
     def _present_today(self, class_id: str) -> Set[str]:
+        """IDs with any daytime status (Present/Late/Excused) — 'mark absent'
+        must never touch students who are excused."""
         df = self.records_df(class_id)
         if df.empty:
             return set()
-        m = ((df.Date == self._today()) & df.Status.isin(["Present", "Late"]))
+        m = ((df.Date == self._today()) & df.Status.isin(ACTIVE_STATUSES))
         return set(df[m].ID)
 
     def mark_absent_all(self, class_id: Optional[str] = None) -> int:
@@ -350,8 +354,8 @@ class Store:
         return count
 
     def attendance_rates(self, class_id: str) -> pd.DataFrame:
-        """Per-student attendance across all recorded sessions of a class.
-        Sessions = dates on which this class has any record."""
+        """Rate = attended / (sessions - excused sessions). Excused sessions are
+        removed from the denominator instead of counting against the student."""
         df = self.records_df(class_id)
         people = self.load_people()
         roster = self.load_classes().get(class_id, {}).get("students", [])
@@ -359,10 +363,14 @@ class Store:
             return pd.DataFrame(columns=["ID", "Name", "Sessions", "Attended", "Rate"])
         sessions = df.Date.nunique()
         attended = df[df.Status.isin(["Present", "Late"])].groupby("ID").Date.nunique()
-        rows = [{"ID": pid, "Name": people.get(pid, {}).get("name", pid),
-                 "Sessions": sessions, "Attended": int(attended.get(pid, 0)),
-                 "Rate": f"{100 * attended.get(pid, 0) / sessions:.0f}%"}
-                for pid in roster]
+        excused = df[df.Status == "Excused"].groupby("ID").Date.nunique()
+        rows = []
+        for pid in roster:
+            eff = sessions - int(excused.get(pid, 0))
+            att = int(attended.get(pid, 0))
+            rate = f"{100 * att / eff:.0f}%" if eff > 0 else "—"
+            rows.append({"ID": pid, "Name": people.get(pid, {}).get("name", pid),
+                         "Sessions": sessions, "Attended": att, "Rate": rate})
         return pd.DataFrame(rows).sort_values("Rate")
 
     # ======================= exports / backup =======================
