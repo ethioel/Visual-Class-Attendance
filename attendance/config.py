@@ -14,10 +14,10 @@ class Config:
     detect_scale: float = field(default_factory=lambda: float(os.environ.get("ATT_DETECT_SCALE", "0.5")))
     frame_skip: int = field(default_factory=lambda: int(os.environ.get("ATT_FRAME_SKIP", "3")))
     late_after: Optional[str] = field(default_factory=lambda: os.environ.get("ATT_LATE_AFTER", "09:00") or None)
-    timezone: str = field(default_factory=lambda: os.environ.get("ATT_TZ", ""))  # e.g. "Africa/Addis_Ababa"
+    timezone: str = field(default_factory=lambda: os.environ.get("ATT_TZ", ""))
     camera_index: int = field(default_factory=lambda: int(os.environ.get("ATT_CAMERA", "0")))
     enroll_jitters: int = field(default_factory=lambda: int(os.environ.get("ATT_ENROLL_JITTERS", "10")))
-    
+
     @property
     def attendance_csv(self) -> str: return os.path.join(self.db_dir, "attendance_log.csv")
     @property
