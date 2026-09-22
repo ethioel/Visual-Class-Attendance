@@ -12,8 +12,7 @@ _BACKEND = None  # lazy singleton: (mtcnn, resnet, torch)
 
 def _get_backend():
     """MTCNN detector + InceptionResnetV1 (VGGFace2, 512-d) on CPU.
-    Weights (~100 MB) download on first use, cached per runtime.
-    Lazy import → tests/CI never touch torch."""
+    Weights (~100 MB) download on first use. Lazy import → tests/CI never touch torch."""
     global _BACKEND
     if _BACKEND is None:
         import torch
@@ -23,12 +22,11 @@ def _get_backend():
         _BACKEND = (mtcnn, resnet, torch)
     return _BACKEND
 
+
 def detect_and_encode(rgb, scale: float = 1.0, model: str = "facenet",
                       num_jitters: int = 1):
     """Detect + encode. Returns ((top,right,bottom,left) boxes in ORIGINAL scale,
     512-d L2-normalized embeddings). num_jitters>1 adds horizontal-flip TTA.
-    `model` kept for API compatibility.
-
     Faces are cropped manually (box → resize 160×160 → (x-127.5)/128), mirroring
     facenet-pytorch's official manual-crop pipeline. Deliberately avoids
     MTCNN.extract(), whose signature differs between library versions."""
