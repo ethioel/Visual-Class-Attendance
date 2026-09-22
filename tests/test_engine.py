@@ -21,3 +21,8 @@ def test_bad_sample_does_not_break_match():
     db, a = make_db()
     db["A"].append(unit(rng.normal(size=128)))       # one corrupted sample
     assert best_match(a, db, tolerance=0.6)[0] == "A"
+
+def test_dimension_guard_skips_legacy():
+    db, a = make_db()
+    db["A"].append(np.ones(512))                     # wrong-dim (facenet) sample
+    assert best_match(a, db, tolerance=0.6)[0] == "A"
