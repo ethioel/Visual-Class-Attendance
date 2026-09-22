@@ -92,7 +92,7 @@ def best_match(encoding, encodings_db: Dict[str, list],
     return None, best_score
 
 
-def recognize(rgb, encodings_db, tolerance: float = 1.0, scale: float = 0.5,
+def recognize(rgb, encodings_db, tolerance: float = 1.0, scale: float = 1.0,
               model: str = "facenet",
               prob_threshold: float = 0.90) -> List[Recognition]:
     locs, encs = detect_and_encode(rgb, scale=scale, model=model,
