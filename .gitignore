@@ -1,5 +1,6 @@
 # biometric + personal data — never commit
 attendance_db/
+demo_db/
 *.xlsx
 *.csv
 
@@ -10,7 +11,7 @@ __pycache__/
 venv/
 .pytest_cache/
 
-# editor/os
+# editor/os / secrets
 .DS_Store
 .idea/
 .vscode/
