@@ -30,7 +30,8 @@ div[data-testid="stVerticalBlockBorderWrapper"]{border-radius:14px;border:1px so
 [data-testid="stBaseButton-primary"]:hover{filter:brightness(1.07);}
 .pill{display:inline-block;padding:.16rem .55rem;border-radius:999px;font-size:.70rem;font-weight:700;vertical-align:middle;}
 .pill-present{background:#DCFCE7;color:#166534;} .pill-late{background:#FEF3C7;color:#92400E;}
-.pill-absent{background:#FEE2E2;color:#991B1B;} .pill-muted{background:#E2E8F0;color:#334155;}
+.pill-absent{background:#FEE2E2;color:#991B1B;} .pill-excused{background:#DBEAFE;color:#1E40AF;}
+.pill-muted{background:#E2E8F0;color:#334155;}
 .pill-admin{background:#E0E7FF;color:#3730A3;} .pill-teacher{background:#D1FAE5;color:#065F46;}
 .pill-guest{background:#FDE68A;color:#78350F;}
 .sec{display:flex;align-items:center;gap:.5rem;font-weight:800;font-size:1.15rem;margin:.3rem 0 1rem;}
@@ -88,7 +89,8 @@ def pill(text: str, kind: str) -> str:
     return f'<span class="pill pill-{kind}">{text}</span>'
 
 
-STATUS_EMOJI = {"Present": "✅ Present", "Late": "⏰ Late", "Absent": "🚫 Absent"}
+STATUS_EMOJI = {"Present": "✅ Present", "Late": "⏰ Late", "Absent": "🚫 Absent",
+                "Excused": "📝 Excused"}
 
 
 def user_chip(user: dict) -> None:
@@ -109,7 +111,7 @@ def hero() -> None:
     st.markdown('<div class="hero"><h1>🪪 Visual Attendance</h1>'
                 "<p>Face-first classroom operations — enroll once, scan the room, done.</p>"
                 '<div class="chips"><span>Multi-sample enrollment</span><span>Roster-scoped matching</span>'
-                "<span>Live auto-capture</span><span>Dark mode</span></div></div>",
+                "<span>Hands-free live scan</span><span>Dark mode</span></div></div>",
                 unsafe_allow_html=True)
 
 
