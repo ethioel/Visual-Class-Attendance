@@ -782,76 +782,90 @@ def page_students():
     tab_import, tab_photos, tab_edit = st.tabs(
         ["📥 Import from file", "📷 Missing face samples", "✏️ Edit students"])
 
+    # NOTE: no early returns inside tabs — a `return` here would abort the
+    # whole page and blank every tab defined after it (v2.11.0 bug).
+
     with tab_import:
         f = st.file_uploader("Upload CSV or Excel with columns **Name** "
                              "(and optional **ID**)",
                              type=["csv", "xlsx", "xls"])
-        if f is not None:
+        if f is None:
+            st.caption("Tip: you can edit IDs/names in the preview before "
+                       "importing.")
+        else:
             try:
                 roster = parse_roster(pd.read_csv(f) if f.name.endswith("csv")
                                       else pd.read_excel(f))
             except Exception as e:
                 st.error(f"Could not read file: {e}")
-                return
-            st.caption("Edit IDs/names below before importing "
-                       "(add/remove rows freely).")
-            preview = st.data_editor(roster, num_rows="dynamic", hide_index=True,
-                                     width="stretch", key="import_prev")
-            targets = st.multiselect("Add imported students to class(es)",
-                                     list(classes),
-                                     format_func=lambda c: f"{classes[c]['name']} ({c})")
-            if st.button(f"📥 Import {len(preview)} student(s)", type="primary"):
-                new = skip = 0
-                for _, r in preview.iterrows():
-                    if store.ensure_person(str(r["ID"]).strip(),
-                                           str(r["Name"]).strip()):
-                        new += 1
-                        for tgt in targets:
-                            store.add_to_class(tgt, str(r["ID"]).strip())
-                    else:
-                        skip += 1
-                flash("success", f"Imported {new} new student(s)"
-                                 + (f", skipped {skip} existing." if skip else "."))
-                st.rerun()
+                roster = None
+            if roster is not None:
+                st.caption("Edit IDs/names below before importing "
+                           "(add/remove rows freely).")
+                preview = st.data_editor(roster, num_rows="dynamic",
+                                         hide_index=True, width="stretch",
+                                         key="import_prev")
+                targets = st.multiselect(
+                    "Add imported students to class(es)", list(classes),
+                    format_func=lambda c: f"{classes[c]['name']} ({c})")
+                if st.button(f"📥 Import {len(preview)} student(s)",
+                             type="primary"):
+                    new = skip = 0
+                    for _, r in preview.iterrows():
+                        if store.ensure_person(str(r["ID"]).strip(),
+                                               str(r["Name"]).strip()):
+                            new += 1
+                            for tgt in targets:
+                                store.add_to_class(tgt, str(r["ID"]).strip())
+                        else:
+                            skip += 1
+                    flash("success", f"Imported {new} new student(s)"
+                                     + (f", skipped {skip} existing."
+                                        if skip else "."))
+                    st.rerun()
 
     with tab_photos:
         pending = store.pending_samples()
         if not pending:
             empty_state("✅", "Everyone has face samples",
                         f"All students have at least {cfg.n_samples} samples.")
-            return
-        st.caption(f"**{len(pending)}** student(s) still need face samples — "
-                   "imported from a file or saved without photos.")
-        pick = st.selectbox("Student", list(pending),
-                            format_func=lambda p: f"{pending[p].get('name', p)} · {p}")
-        ms_targets = st.multiselect(
-            "Add this student to class(es) on save", list(classes),
-            format_func=lambda c: f"{classes[c]['name']} ({c})",
-            key=f"mstargets::{pick}")
-        ups = st.file_uploader("Upload photo files (JPG/PNG — one face per photo)",
-                               type=["jpg", "jpeg", "png"], accept_multiple_files=True,
-                               key=f"up::{pick}")
-        if ups and st.button(f"➕ Add {len(ups)} uploaded photo(s) as samples"):
-            added = 0
-            for upf in ups:
-                arr = np.frombuffer(upf.getvalue(), np.uint8)
-                bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                if bgr is None:
-                    continue
-                locs, encs = detect_and_encode(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB),
-                                               scale=1.0, num_jitters=3)
-                if locs:
-                    store.enroll(pick, pending[pick].get("name", pick), [encs[0]])
-                    added += 1
-            for _t in ms_targets:
-                store.add_to_class(_t, pick)
-            flash("success" if added else "error",
-                  f"Added {added} sample(s) from photos." if added
-                  else "No usable faces found in the uploaded photos.")
-            st.rerun()
-        st.markdown("**…or capture with the camera**")
-        capture_section(pick, pending[pick].get("name", pick), store, cfg,
-                        class_targets=ms_targets)
+        else:
+            st.caption(f"**{len(pending)}** student(s) still need face samples — "
+                       "imported from a file or saved without photos.")
+            pick = st.selectbox(
+                "Student", list(pending),
+                format_func=lambda p: f"{pending[p].get('name', p)} · {p}")
+            ms_targets = st.multiselect(
+                "Add this student to class(es) on save", list(classes),
+                format_func=lambda c: f"{classes[c]['name']} ({c})",
+                key=f"mstargets::{pick}")
+            ups = st.file_uploader(
+                "Upload photo files (JPG/PNG — one face per photo)",
+                type=["jpg", "jpeg", "png"], accept_multiple_files=True,
+                key=f"up::{pick}")
+            if ups and st.button(f"➕ Add {len(ups)} uploaded photo(s) as samples"):
+                added = 0
+                for upf in ups:
+                    arr = np.frombuffer(upf.getvalue(), np.uint8)
+                    bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                    if bgr is None:
+                        continue
+                    locs, encs = detect_and_encode(
+                        cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB),
+                        scale=1.0, num_jitters=3)
+                    if locs:
+                        store.enroll(pick, pending[pick].get("name", pick),
+                                     [encs[0]])
+                        added += 1
+                for _t in ms_targets:
+                    store.add_to_class(_t, pick)
+                flash("success" if added else "error",
+                      f"Added {added} sample(s) from photos." if added
+                      else "No usable faces found in the uploaded photos.")
+                st.rerun()
+            st.markdown("**…or capture with the camera**")
+            capture_section(pick, pending[pick].get("name", pick), store, cfg,
+                            class_targets=ms_targets)
 
     with tab_edit:
         counts = store.sample_counts()
@@ -862,7 +876,7 @@ def page_students():
                 status = "✅ Ready"
             elif n > 0:
                 status = "🟡 Partial — add more samples"
-            elif info.get("backend"):            # stamped but zero current samples
+            elif info.get("backend"):
                 status = "🔴 Needs recapture (model updated)"
             else:
                 status = "⚪ No face samples"
@@ -872,24 +886,29 @@ def page_students():
         if base.empty:
             empty_state("👥", "No students yet",
                         "Enroll, import, or share a class invite link.")
-            return
-        st.caption(f"**{len(base)}** student(s) total · "
-                   f"{(base.Samples >= cfg.n_samples).sum()} ready for recognition")
-        show = st.selectbox("Show", ["All students", "Only those needing samples"],
-                            key="edit_filter")
-        view = base if show == "All students" else base[base.Samples < cfg.n_samples]
-        ed = st.data_editor(view, disabled=["ID", "Samples", "Status"],
-                            hide_index=True, width="stretch",
-                            num_rows="fixed", key="edit_people")
-        if st.button("💾 Save name changes"):
-            n = 0
-            for _, row in ed.iterrows():
-                if row["Name"] != base.loc[base.ID == row["ID"], "Name"].iloc[0]:
-                    store.rename_person(row["ID"], row["Name"])
-                    n += 1
-            flash("success" if n else "info",
-                  f"Renamed {n} student(s)." if n else "No changes to apply.")
-            st.rerun()
+        else:
+            st.caption(f"**{len(base)}** student(s) total · "
+                       f"{(base.Samples >= cfg.n_samples).sum()} ready for "
+                       "recognition")
+            show = st.selectbox("Show",
+                                ["All students", "Only those needing samples"],
+                                key="edit_filter")
+            view = (base if show == "All students"
+                    else base[base.Samples < cfg.n_samples])
+            ed = st.data_editor(view, disabled=["ID", "Samples", "Status"],
+                                hide_index=True, width="stretch",
+                                num_rows="fixed", key="edit_people")
+            if st.button("💾 Save name changes"):
+                n = 0
+                for _, row in ed.iterrows():
+                    orig = base.loc[base.ID == row["ID"], "Name"]
+                    if not orig.empty and row["Name"] != orig.iloc[0]:
+                        store.rename_person(row["ID"], row["Name"])
+                        n += 1
+                flash("success" if n else "info",
+                      f"Renamed {n} student(s)." if n
+                      else "No changes to apply.")
+                st.rerun()
 
 
 # ================= CLASSES / TEACHERS / RECORDS =================
@@ -1124,11 +1143,11 @@ with st.sidebar:
             store.set_setting("timezone", tz)
             cfg.timezone = tz
             st.toast(f"Time zone set to {tz}")
-    if not guest and auth.default_admin:
-        st.error("⚠️ Admin still uses the default password — change it under "
+    if user["role"] == "admin" and not guest and auth.default_admin:
+        st.error("⚠️ You're using the default admin password — change it under "
                  "Teachers.")
     if st.button("Log out", width="stretch"):
         st.session_state.clear()
         st.rerun()
-    st.caption("v2.11 · self-hosted · data stays local")
+    st.caption("v2.11.1 · self-hosted · data stays local")
 pg.run()
