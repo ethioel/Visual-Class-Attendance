@@ -4,6 +4,7 @@ import csv
 import json
 import os
 import pickle
+import secrets
 import tempfile
 import threading
 from typing import Dict, List, Optional, Set, Tuple
@@ -12,9 +13,12 @@ import numpy as np
 import pandas as pd
 
 from .config import Config
+from .engine import BACKEND_ID
 
 COLS = ["Date", "Time", "Class", "ID", "Name", "Status"]
-ACTIVE_STATUSES = ("Present", "Late", "Excused")   # any of these blocks auto-marks
+ACTIVE_STATUSES = ("Present", "Late", "Excused")
+
+_INVITE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"   # no 0/O, 1/I
 
 
 def _atomic_dump(path: str, mode: str, writer) -> None:
@@ -63,7 +67,7 @@ class Store:
 
     def enroll(self, person_id: str, name: str, encodings: List[np.ndarray]) -> None:
         """Add face samples. Creates the person if new; appends + updates the
-        display name if they already exist."""
+        display name if they already exist. Stamps the backend ID."""
         if not encodings:
             return
         with self._lock:
@@ -78,6 +82,7 @@ class Store:
                 enc[person_id] = list(encodings)
                 people[person_id] = {"name": name, "samples": len(encodings),
                                      "registered": self.cfg.now().isoformat(timespec="seconds")}
+            people[person_id]["backend"] = BACKEND_ID
             self.save_people(people)
             self.save_encodings(enc)
 
@@ -136,13 +141,16 @@ class Store:
 
     # ======================= encodings =======================
     def load_encodings(self) -> Dict[str, List[np.ndarray]]:
+        """Only encodings whose person is stamped with the CURRENT backend —
+        older-backend samples are invisible (never matched, never crash)."""
         with self._lock:
             people = self.load_people()
             if not os.path.exists(self.cfg.enc_cache):
                 return {}
             with open(self.cfg.enc_cache, "rb") as f:
                 enc = pickle.load(f)
-            return {k: v for k, v in enc.items() if k in people}
+            return {k: v for k, v in enc.items()
+                    if k in people and people[k].get("backend") == BACKEND_ID}
 
     def save_encodings(self, enc: Dict[str, List[np.ndarray]]) -> None:
         with self._lock:
@@ -217,6 +225,42 @@ class Store:
     def classes_of(self, username: str) -> Dict[str, dict]:
         return {cid: c for cid, c in self.load_classes().items()
                 if c.get("teacher") == username}
+
+    # ---------- invite codes ----------
+    def _new_invite_code(self) -> str:
+        return "".join(secrets.choice(_INVITE_ALPHABET) for _ in range(6))
+
+    def ensure_class_invite(self, class_id: str) -> Optional[str]:
+        """Return the class's invite code, creating one if needed."""
+        with self._lock:
+            classes = self.load_classes()
+            cls = classes.get(class_id)
+            if cls is None:
+                return None
+            if not cls.get("invite"):
+                cls["invite"] = self._new_invite_code()
+                self._save_classes(classes)
+            return cls["invite"]
+
+    def regenerate_invite(self, class_id: str) -> Optional[str]:
+        """Invalidate the old link and issue a fresh code."""
+        with self._lock:
+            classes = self.load_classes()
+            if class_id not in classes:
+                return None
+            classes[class_id]["invite"] = self._new_invite_code()
+            self._save_classes(classes)
+            return classes[class_id]["invite"]
+
+    def class_by_invite(self, code: str) -> Optional[str]:
+        code = (code or "").strip().upper()
+        if not code:
+            return None
+        with self._lock:
+            for cid, cls in self.load_classes().items():
+                if cls.get("invite") == code:
+                    return cid
+        return None
 
     # ======================= settings =======================
     @property
@@ -296,10 +340,8 @@ class Store:
 
     def set_status(self, person_id: str, name: str, status: Optional[str],
                    class_id: str = "GENERAL", date: Optional[str] = None) -> bool:
-        """Upsert a record with an explicit status (manual editing).
-        status=None removes the row (unmarks, so a later scan can re-mark).
-        Excused upserts like Present/Late — only ever set manually.
-        Time reflects when the status was last set."""
+        """Upsert a record with an explicit status. status=None removes the row.
+        Excused upserts like Present/Late — only ever set manually."""
         date = date or self._today()
         now_t = self.cfg.now().strftime("%H:%M:%S")
         with self._lock:
@@ -314,7 +356,7 @@ class Store:
                         "ID": person_id, "Name": name, "Status": status}])],
                         ignore_index=True)
                 self._marked.add((date, class_id, person_id))
-            else:                                      # unmark / remove
+            else:
                 df = df[~mask]
                 self._marked.discard((date, class_id, person_id))
             _atomic_dump(self.cfg.attendance_csv, "w",
@@ -324,8 +366,6 @@ class Store:
         return True
 
     def _present_today(self, class_id: str) -> Set[str]:
-        """IDs with any daytime status (Present/Late/Excused) — 'mark absent'
-        must never touch students who are excused."""
         df = self.records_df(class_id)
         if df.empty:
             return set()
@@ -354,8 +394,7 @@ class Store:
         return count
 
     def attendance_rates(self, class_id: str) -> pd.DataFrame:
-        """Rate = attended / (sessions - excused sessions). Excused sessions are
-        removed from the denominator instead of counting against the student."""
+        """Rate = attended / (sessions - excused sessions)."""
         df = self.records_df(class_id)
         people = self.load_people()
         roster = self.load_classes().get(class_id, {}).get("students", [])
@@ -372,6 +411,26 @@ class Store:
             rows.append({"ID": pid, "Name": people.get(pid, {}).get("name", pid),
                          "Sessions": sessions, "Attended": att, "Rate": rate})
         return pd.DataFrame(rows).sort_values("Rate")
+
+    def heatmap(self, class_id: str, year_month: Optional[str] = None) -> pd.DataFrame:
+        """Students × days grid for one month. Status per cell;
+        'No record' where the student simply wasn't scanned that day."""
+        df = self.records_df(class_id)
+        people = self.load_people()
+        roster = self.load_classes().get(class_id, {}).get("students", [])
+        if df.empty or not roster:
+            return pd.DataFrame(columns=["Name", "Date", "Status"])
+        if year_month is None:
+            year_month = self._today()[:7]
+        df = df[df.Date.str.startswith(year_month)]
+        dates = sorted(df.Date.unique())
+        if not dates:
+            return pd.DataFrame(columns=["Name", "Date", "Status"])
+        lookup = {(r.ID, r.Date): r.Status for r in df.itertuples()}
+        rows = [{"Name": people.get(pid, {}).get("name", pid), "Date": d,
+                 "Status": lookup.get((pid, d), "No record")}
+                for pid in roster for d in dates]
+        return pd.DataFrame(rows)
 
     # ======================= exports / backup =======================
     def _sync_excel(self) -> None:
