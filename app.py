@@ -1,4 +1,5 @@
 import base64
+import logging
 import os
 import time
 from io import BytesIO
@@ -16,6 +17,18 @@ try:
 except Exception:
     pass
 
+
+class _FragmentNoise(logging.Filter):
+    """Silence orphaned-fragment polling warnings (harmless client timers)."""
+    def filter(self, record):
+        return "does not exist anymore" not in record.getMessage()
+
+
+_l = logging.getLogger("streamlit")
+_l.addFilter(_FragmentNoise())
+for _h in _l.handlers:
+    _h.addFilter(_FragmentNoise())
+
 from camera_input_live import camera_input_live
 
 from attendance.auth import Auth
@@ -32,15 +45,15 @@ st.set_page_config(page_title="Visual Attendance", page_icon="🪪", layout="wid
 MAIN_DB = os.environ.get("ATT_DB_DIR", "attendance_db")
 GUEST_DB = "demo_db"
 STATUS_OPTS = ["—", "Present", "Late", "Excused", "Absent"]
-WORK_WIDTH = 960
-LIVE_PROB = 0.85
+WORK_WIDTH = 960          # recognition working width (px)
+LIVE_PROB = 0.85          # MTCNN prob threshold for camera frames
 
 
 @st.cache_resource
 def resources(db_dir: str):
     cfg = Config(db_dir=db_dir)
     store, auth = Store(cfg), Auth(cfg)
-    tz = store.get_settings().get("timezone")
+    tz = store.get_settings().get("timezone")          # UI setting > env > system
     if tz:
         cfg.timezone = tz
     return cfg, store, auth
@@ -210,21 +223,35 @@ def page_dashboard():
 
 
 # ================= ATTENDANCE =================
-def _class_readiness_card(cid: str, cls: dict, enc: dict):
+def _class_readiness_card(cid: str, cls: dict):
     """Plain-language readiness: who's in the class, who still needs face
-    samples, with a one-click link to fix it."""
+    samples — with one-click fixes for both."""
     students = cls.get("students", [])
-    missing = [p for p in students if p not in enc_all]
     if not students:
-        st.info("No students in this class yet. Add them in **➕ Enroll student** "
-                "(select this class) or **👥 Students → Import from file**.")
+        with st.container(border=True):
+            st.warning("No students in this class yet.")
+            candidates = [p for p in people if p not in students]
+            if candidates:
+                pick = st.multiselect(
+                    "Add existing students to this class", candidates,
+                    format_func=lambda p: f"{people[p].get('name', p)} ({p})",
+                    key=f"quickadd::{cid}")
+                if pick and st.button("Add to class", key=f"quickaddb::{cid}",
+                                      type="primary"):
+                    for p in pick:
+                        store.add_to_class(cid, p)
+                    st.rerun()
+            PAGES.get("Enroll student") and st.page_link(
+                PAGES["Enroll student"],
+                label="➕ …or enroll a new student (select this class)", icon="➕")
         return
+    missing = [p for p in students if p not in enc_all]
     if missing:
         names = [people[p].get("name", p) for p in missing]
         shown = ", ".join(names[:8]) + ("…" if len(names) > 8 else "")
         with st.container(border=True):
-            st.warning(f"**{len(missing)} of {len(students)}** students in this class "
-                       f"don't have face samples yet: {shown}")
+            st.warning(f"**{len(missing)} of {len(students)}** students don't have "
+                       f"face samples yet: {shown}")
             PAGES.get("Students") and st.page_link(
                 PAGES["Students"], label="📷 Capture their face samples now",
                 icon="📷")
@@ -241,7 +268,7 @@ def page_attendance():
                        format_func=lambda c: f"{classes[c]['name']} · {c}")
     cls = classes[cid]
     enc = {p: enc_all[p] for p in cls.get("students", []) if p in enc_all}
-    _class_readiness_card(cid, cls, enc)
+    _class_readiness_card(cid, cls)
     tolerance = st.slider("Match tolerance (lower = stricter)", 0.60, 1.40,
                           cfg.tolerance, 0.01)
     mode = st.radio("Scan mode", ["🎥 Live auto-scan (hands-free)", "📷 Single photo"],
@@ -311,45 +338,44 @@ def _apply_marks(results, cid: str, sess: dict):
 
 
 def _live_session(cid: str, cls: dict, enc: dict, tolerance: float):
-    """Start/Stop live session. Camera mounts only after Start; each interval
-    grabs one frame → detect → mark → repeat. End shows a results card."""
+    """Start/Stop live session. The recognition fragment is ALWAYS mounted
+    while this section renders; its body gates on sess['started'] — so timers
+    never outlive the fragment (no orphan warnings)."""
     key = f"session::{cid}"
     sess = st.session_state.setdefault(key, {"started": False, "log": [],
                                              "captures": 0, "unknown": 0,
                                              "vis": None, "interval": 5})
     summary_key = f"summary::{cid}"
     status = store.status_now(cls.get("late_after"))
-
     if not enc:
         return
 
-    # ---------- NOT STARTED: trigger card (+ previous session results) ----------
-    if not sess["started"]:
-        if summary_key in st.session_state:
-            _render_session_summary(summary_key, cid)
-        with st.container(border=True):
-            st.markdown("**🎥 Live auto-scan**")
-            st.caption(f"Walk-through marking · {len(enc)} students ready · "
-                       f"new scans mark as **{status}** · camera opens only "
-                       "after you press Start.")
-            sess["interval"] = st.select_slider(
-                "Capture interval", options=[3, 5, 8], value=sess.get("interval", 5),
-                format_func=lambda v: f"every {v}s")
-            if st.button("▶️ Start live session", type="primary", width="stretch"):
-                sess.update(started=True, log=[], captures=0, unknown=0, vis=None)
-                st.session_state.pop(summary_key, None)
-                st.rerun()
-        return
-
-    # ---------- RUNNING ----------
-    st.caption(f"🔴 **LIVE** · capturing every {sess['interval']}s → detect → "
-               f"mark → repeat · marking as **{status}** · first capture warms "
-               "the model (~30–60s once per reboot)")
     left, right = st.columns([5, 4])
 
     with left:
-        @st.fragment(run_every=float(sess["interval"]))
+        if not sess["started"]:
+            if summary_key in st.session_state:
+                _render_session_summary(summary_key, cid)
+            with st.container(border=True):
+                st.markdown("**🎥 Live auto-scan**")
+                st.caption(f"Walk-through marking · {len(enc)} students ready · "
+                           f"new scans mark as **{status}**.")
+                sess["interval"] = st.select_slider(
+                    "Capture interval", options=[3, 5, 8],
+                    value=sess.get("interval", 5),
+                    format_func=lambda v: f"every {v}s")
+                if st.button("▶️ Start live session", type="primary",
+                             width="stretch"):
+                    sess.update(started=True, log=[], captures=0,
+                                unknown=0, vis=None)
+                    st.session_state.pop(summary_key, None)
+                    st.rerun()
+
+        @st.fragment(run_every=float(sess.get("interval", 5)))
         def _loop():
+            if not sess["started"]:
+                st.caption("🔴 Camera off — press ▶️ Start live session.")
+                return
             try:
                 frame = camera_frame_bgr()
             except Exception as e:
@@ -375,7 +401,7 @@ def _live_session(cid: str, cls: dict, enc: dict, tolerance: float):
                 st.toast(f"{', '.join(new_marks)} — marked", icon="🪪")
 
         _loop()
-        if sess["vis"] is not None:
+        if sess["started"] and sess["vis"] is not None:
             st.image(sess["vis"], width="stretch")
 
     with right:
@@ -386,12 +412,13 @@ def _live_session(cid: str, cls: dict, enc: dict, tolerance: float):
         c3.metric("Captures", sess["captures"])
         if sess["log"]:
             st.dataframe(pd.DataFrame(sess["log"]), hide_index=True, width="stretch")
-        else:
+        elif sess["started"]:
             st.caption("Recognized students appear here automatically.")
         if sess["unknown"] >= 3:
             st.warning("Repeated unknown faces — they may not be enrolled, or "
                        "not added to this class.")
-        if st.button("⏹️ End session", type="primary", width="stretch"):
+        if sess["started"] and st.button("⏹️ End session", type="primary",
+                                         width="stretch"):
             st.session_state[summary_key] = {
                 "log": list(sess["log"]), "unknown": sess["unknown"],
                 "captures": sess["captures"],
@@ -486,69 +513,79 @@ def _single_photo(cid: str, cls: dict, enc: dict, tolerance: float):
 
 
 # ================= ENROLL =================
-def capture_section(pid: str, name: str, store: Store, cfg: Config):
-    """Capture widget for one student: 🎥 Auto-capture (camera detects and
-    grabs good samples hands-free) or 📷 Manual snapshots."""
+def capture_section(pid: str, name: str, store: Store, cfg: Config,
+                    class_targets: list | None = None):
+    """Capture widget for one student. class_targets = classes the student is
+    added to on save."""
+    class_targets = class_targets or []
     cap = st.session_state.setdefault(f"cap::{pid}", {"samples": [], "thumbs": []})
     run_key = f"auto::{pid}"
+    done_key = f"autodone::{pid}"
     mode = st.radio("Capture mode",
                     ["🎥 Auto-capture (hands-free)", "📷 Manual snapshots"],
                     horizontal=True, key=f"cmode::{pid}")
 
     if mode.startswith("🎥"):
-        if not st.session_state.get(run_key):
-            if st.button("▶️ Start auto-capture", type="primary", width="stretch"):
-                st.session_state[run_key] = True
-                st.rerun()
-        else:
-            st.caption(f"🔴 **LIVE** — the camera detects your face and grabs "
-                       f"{cfg.n_samples} good samples automatically. Vary your "
-                       "angle slightly between grabs.")
+        # controls (outside fragment — full reruns are safe, fragment stays mounted)
+        if st.session_state.get(run_key):
             if st.button("⏹️ Stop camera", width="stretch"):
                 st.session_state[run_key] = False
+                st.session_state[done_key] = False
+                st.rerun()
+        else:
+            if st.button("▶️ Start auto-capture", type="primary", width="stretch"):
+                st.session_state[run_key] = True
+                st.session_state[done_key] = False
                 st.rerun()
 
-            @st.fragment(run_every=3.0)
-            def _auto():
-                try:
-                    frame = camera_frame_bgr()
-                except Exception as e:
-                    st.error(f"Camera error: {str(e)[:160]}")
-                    return
-                if frame is None:
-                    st.info("Starting camera… allow the permission pop-up (once).")
-                    return
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                bright = float(gray.mean())
-                sharp = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-                try:
-                    locs, encs = detect_and_encode(rgb, scale=1.0,
-                                                   num_jitters=cfg.enroll_jitters)
-                except Exception as e:
-                    st.error(f"Recognition error: {str(e)[:160]}")
-                    return
-                n = len(cap["samples"])
+        # fragment ALWAYS mounted in this mode; body gates on flags → no orphan timers
+        @st.fragment(run_every=3.0)
+        def _auto():
+            if st.session_state.get(done_key):
+                suggestion_box("✅ All samples captured — press Save below.")
+                return
+            if not st.session_state.get(run_key):
+                st.caption("📷 Camera off — press ▶️ Start auto-capture.")
+                return
+            try:
+                frame = camera_frame_bgr()
+            except Exception as e:
+                st.error(f"Camera error: {str(e)[:160]}")
+                return
+            if frame is None:
+                st.info("Starting camera… allow the permission pop-up (once).")
+                return
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            bright, sharp = float(gray.mean()), float(cv2.Laplacian(gray, cv2.CV_64F).var())
+            try:
+                locs, encs = detect_and_encode(rgb, scale=1.0,
+                                               num_jitters=cfg.enroll_jitters)
+            except Exception as e:
+                st.error(f"Recognition error: {str(e)[:160]}")
+                return
+            n = len(cap["samples"])
+            if n < cfg.n_samples:
                 good = (len(locs) == 1 and 55 <= bright <= 210 and sharp >= 30)
-                if good and n < cfg.n_samples and \
-                        time.time() - st.session_state.get(f"lc::{pid}", 0) > 2.5:
+                if good and time.time() - st.session_state.get(f"lc::{pid}", 0) > 2.5:
                     cap["samples"].append(encs[0])
                     cap["thumbs"].append(face_thumb(rgb, locs[0], 72))
                     st.session_state[f"lc::{pid}"] = time.time()
                     n += 1
                     st.toast(f"Sample {n}/{cfg.n_samples} captured", icon="📸")
-                if n >= cfg.n_samples:
-                    suggestion_box("✅ All samples captured — press Save below.")
-                    st.session_state[run_key] = False
-                    st.rerun()
                 suggestion_box(live_suggestion(len(locs), bright, sharp))
-                st.progress(min(n / cfg.n_samples, 1.0),
-                            text=f"{n}/{cfg.n_samples} samples captured")
-                th = st.columns(5)
-                for i, tmb in enumerate(cap["thumbs"]):
-                    th[i % 5].image(tmb, width="stretch")
+            else:
+                # done: stop camera inside the fragment, flip flags
+                st.session_state[run_key] = False
+                st.session_state[done_key] = True
+                st.rerun()
+            st.progress(min(n / cfg.n_samples, 1.0),
+                        text=f"{n}/{cfg.n_samples} samples captured")
+            th = st.columns(5)
+            for i, tmb in enumerate(cap["thumbs"]):
+                th[i % 5].image(tmb, width="stretch")
 
-            _auto()
+        _auto()
     else:
         left, right = st.columns([3, 2])
         with left:
@@ -576,10 +613,18 @@ def capture_section(pid: str, name: str, store: Store, cfg: Config):
         if st.button(f"💾 Save {len(cap['samples'])} sample(s) for {name or pid}",
                      type="primary", width="stretch"):
             store.enroll(pid, name or pid, cap["samples"])
+            added = [t for t in class_targets if store.add_to_class(t, pid)]
             st.session_state.pop(f"cap::{pid}", None)
             st.session_state.pop(run_key, None)
-            flash("success",
-                  f"Saved **{name or pid}** with {len(cap['samples'])} samples.")
+            st.session_state.pop(done_key, None)
+            msg = f"Saved **{name or pid}** with {len(cap['samples'])} samples."
+            if added:
+                msg += f" Added to: {', '.join(added)}."
+            elif class_targets:
+                msg += " (Class selection was cleared — re-select if needed.)"
+            else:
+                msg += " ⚠️ Not added to any class — pick one above next time."
+            flash("success" if added else "warning", msg)
             st.rerun()
 
 
@@ -595,18 +640,17 @@ def page_enroll():
     else:
         pid = c2.text_input("Student ID", key="pid")
     name = c3.text_input("Full name", key="pname")
-    targets = st.multiselect("Add to class(es)", list(classes),
-                             format_func=lambda c: f"{classes[c]['name']} ({c})")
-    if classes and not targets:
-        st.caption("💡 Tip: select at least one class — students only get "
-                   "recognized in classes they belong to.")
+    targets = st.multiselect(
+        "Add to class(es) — students are only recognized in classes they belong to",
+        list(classes), format_func=lambda c: f"{classes[c]['name']} ({c})",
+        key="enroll_targets")
     if pid in people:
         st.warning(f"`{pid}` exists — new captures will be **added** to their "
                    "existing samples.")
     if not pid.strip() or not name.strip():
         st.caption("Enter an ID and name to start capturing.")
         return
-    capture_section(pid.strip(), name.strip(), store, cfg)
+    capture_section(pid.strip(), name.strip(), store, cfg, class_targets=targets)
 
 
 # ================= STUDENTS =================
@@ -680,6 +724,10 @@ def page_students():
                    "imported from a file or saved without photos.")
         pick = st.selectbox("Student", list(pending),
                             format_func=lambda p: f"{pending[p].get('name', p)} · {p}")
+        ms_targets = st.multiselect(
+            "Add this student to class(es) on save", list(classes),
+            format_func=lambda c: f"{classes[c]['name']} ({c})",
+            key=f"mstargets::{pick}")
         ups = st.file_uploader("Upload photo files (JPG/PNG — one face per photo)",
                                type=["jpg", "jpeg", "png"], accept_multiple_files=True,
                                key=f"up::{pick}")
@@ -695,12 +743,15 @@ def page_students():
                 if locs:
                     store.enroll(pick, pending[pick].get("name", pick), [encs[0]])
                     added += 1
+            for _t in ms_targets:
+                store.add_to_class(_t, pick)
             flash("success" if added else "error",
                   f"Added {added} sample(s) from photos." if added
                   else "No usable faces found in the uploaded photos.")
             st.rerun()
         st.markdown("**…or capture with the camera**")
-        capture_section(pick, pending[pick].get("name", pick), store, cfg)
+        capture_section(pick, pending[pick].get("name", pick), store, cfg,
+                        class_targets=ms_targets)
 
     with tab_edit:
         counts = store.sample_counts()
@@ -938,5 +989,5 @@ with st.sidebar:
     if st.button("Log out", width="stretch"):
         st.session_state.clear()
         st.rerun()
-    st.caption("v2.9 · self-hosted · data stays local")
+    st.caption("v2.10 · self-hosted · data stays local")
 pg.run()
