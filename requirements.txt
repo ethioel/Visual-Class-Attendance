@@ -1,7 +1,5 @@
 --extra-index-url https://download.pytorch.org/whl/cpu
-streamlit>=1.49        # st.navigation / st.dialog / st.fragment / column_config
-streamlit-webrtc>=0.47
-av>=12
+streamlit>=1.49
 numpy>=1.26,<2.0
 pandas>=2.0
 opencv-python-headless>=4.9,<5
@@ -10,3 +8,4 @@ huggingface_hub>=0.23
 torch==2.2.2+cpu
 torchvision==0.17.2+cpu
 facenet-pytorch==2.6.0
+streamlit-camera-input-live>=0.0.3
