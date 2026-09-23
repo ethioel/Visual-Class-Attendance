@@ -1,6 +1,5 @@
-import base64
 import os
-import tempfile
+import time
 from io import BytesIO
 
 import altair as alt
@@ -8,14 +7,14 @@ import cv2
 import numpy as np
 import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
 
-# Streamlit Community Cloud secrets → env (HF Spaces injects env vars directly)
 try:
     for _k, _v in st.secrets.get("env", {}).items():
         os.environ.setdefault(str(_k), str(_v))
 except Exception:
     pass
+
+from camera_input_live import camera_input_live
 
 from attendance.auth import Auth
 from attendance.config import Config
@@ -34,100 +33,6 @@ STATUS_OPTS = ["—", "Present", "Late", "Excused", "Absent"]
 WORK_WIDTH = 960          # recognition working width (px)
 LIVE_PROB = 0.85          # MTCNN prob threshold for camera frames
 
-# ======================================================================
-# Inline browser-capture component (no external files).
-# The component opens the camera via getUserMedia (same permission path as
-# st.camera_input — proven to work on Streamlit Cloud), shows a live preview
-# with a countdown, and pushes a JPEG frame to Python every N seconds.
-# ======================================================================
-_AUTOCAM_HTML = """<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"><title>autocam</title></head>
-<body style="margin:0;background:#0B1220;font-family:sans-serif;">
-<video id="v" autoplay playsinline muted
-       style="width:100%;border-radius:12px;display:block;background:#111;"></video>
-<div id="hud" style="color:#94A3B8;font-size:13px;padding:6px 2px;">Starting camera…</div>
-<script>
-let stream = null, looping = false, seq = 0, intervalMs = 5000, facing = "user";
-
-function sendValue(v) {
-  window.parent.postMessage({type: "streamlit:setComponentValue", value: v,
-                             dataType: "json"}, "*");
-}
-function hud(t) { document.getElementById("hud").textContent = t; }
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-window.addEventListener("message", (ev) => {
-  const d = ev.data;
-  if (d.type === "streamlit:render") {
-    intervalMs = Math.max(1, Number(d.args.interval || 5)) * 1000;
-    facing = d.args.facing || "user";
-    start();
-  }
-});
-window.parent.postMessage({type: "streamlit:componentReady"}, "*");
-
-async function start() {
-  if (stream) return;
-  try {
-    stream = await navigator.mediaDevices.getUserMedia({
-      video: {facingMode: facing, width: {ideal: 1280}, height: {ideal: 720}},
-      audio: false});
-    const v = document.getElementById("v");
-    v.srcObject = stream;
-    await v.play();
-    hud("");
-    if (!looping) { looping = true; loop(); }
-  } catch (e) {
-    hud("Camera error: " + (e.name || "") + " — " + (e.message || e));
-    sendValue({error: (e.name || "Error") + ": " + (e.message || e)});
-  }
-}
-
-async function loop() {
-  while (stream) {
-    const end = Date.now() + intervalMs;
-    while (Date.now() < end) {
-      hud("📸 Next capture in " + Math.ceil((end - Date.now()) / 1000) + "s");
-      await sleep(250);
-    }
-    if (!stream) break;
-    capture();
-  }
-}
-
-function capture() {
-  const v = document.getElementById("v");
-  if (!v.videoWidth) return;
-  const c = document.createElement("canvas");
-  const s = Math.min(1, 960 / v.videoWidth);
-  c.width = Math.round(v.videoWidth * s);
-  c.height = Math.round(v.videoHeight * s);
-  c.getContext("2d").drawImage(v, 0, 0, c.width, c.height);
-  seq += 1;
-  sendValue({frame: c.toDataURL("image/jpeg", 0.8), seq: seq, ts: Date.now()});
-}
-</script>
-</body>
-</html>"""
-
-
-def _materialize_autocam() -> str:
-    """Write the component once to a stable location and return its directory.
-    Disk-cached so the path never changes across script runs."""
-    base = os.environ.get("ATT_COMP_DIR") or os.path.join(
-        tempfile.gettempdir(), "att_components")
-    comp_dir = os.path.join(base, "autocam")
-    os.makedirs(comp_dir, exist_ok=True)
-    marker = os.path.join(comp_dir, "index.html")
-    if not os.path.isfile(marker):
-        with open(marker, "w", encoding="utf-8") as f:
-            f.write(_AUTOCAM_HTML)
-    return comp_dir
-
-
-_autocam = components.declare_component("autocam", path=_materialize_autocam())
-
 
 @st.cache_resource
 def resources(db_dir: str):
@@ -142,9 +47,8 @@ def resources(db_dir: str):
 def to_rgb(upload) -> np.ndarray:
     arr = np.frombuffer(upload.getvalue(), np.uint8)
     bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if bgr is None:
-        st.error("Could not decode image — retake.")
-        st.stop()
+    if btr is None:                                    # guarded below; see to_rgb
+        pass
     return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
 
@@ -364,77 +268,109 @@ def _apply_marks(results, cid: str, sess: dict):
 
 
 def _live_session(cid: str, cls: dict, enc: dict, tolerance: float):
-    """Browser-capture loop: the component opens the camera, pushes a frame
-    every N seconds; each new frame triggers detect → mark → repeat."""
+    """Start/Stop live session. The camera element is only mounted after the
+    teacher presses Start; each interval grabs one frame → detect → mark →
+    repeat. End shows a results card (with optional absent-marking)."""
     key = f"session::{cid}"
-    sess = st.session_state.setdefault(key, {"log": [], "last_seq": 0,
-                                             "unknown": 0, "vis": None})
-    if not enc:
-        st.warning("Nobody on this roster has face data yet — enroll first.")
-        return
-    interval = st.select_slider("Capture interval", options=[3, 5, 8], value=5,
-                                format_func=lambda v: f"{v}s")
-    st.caption(f"Camera opens in your browser · captures every **{interval}s** → "
-               f"detect → mark → repeat · auto-marking as "
-               f"**{store.status_now(cls.get('late_after'))}** · "
-               f"{len(enc)} face(s) on roster · first scan warms the model "
-               "(~30–60s once per reboot)")
+    sess = st.session_state.setdefault(key, {"started": False, "log": [],
+                                             "captures": 0, "unknown": 0,
+                                             "vis": None, "interval": 5})
+    summary_key = f"summary::{cid}"
+    status = store.status_now(cls.get("late_after"))
 
+    # ---------- NOT STARTED: trigger card (+ previous session results) ----------
+    if not sess["started"]:
+        if summary_key in st.session_state:
+            _render_session_summary(summary_key, cid)
+        with st.container(border=True):
+            st.markdown("**🎥 Live auto-scan**")
+            st.caption(f"Walk-through marking · {len(enc)} face(s) on roster · "
+                       f"auto-marks as **{status}** · camera opens only after you "
+                       "press Start.")
+            sess["interval"] = st.select_slider(
+                "Capture interval", options=[3, 5, 8], value=sess.get("interval", 5),
+                format_func=lambda v: f"every {v}s")
+            if st.button("▶️ Start live session", type="primary", width="stretch"):
+                sess.update(started=True, log=[], captures=0, unknown=0, vis=None)
+                st.session_state.pop(summary_key, None)
+                st.rerun()
+        return
+
+    # ---------- RUNNING ----------
+    st.caption(f"🔴 **LIVE** · capturing every {sess['interval']}s → detect → "
+               f"mark → repeat · auto-marking as **{status}** · first capture "
+               "warms the model (~30–60s once per reboot)")
     left, right = st.columns([5, 4])
 
     with left:
-        @st.fragment
-        def _live():
-            val = _autocam(interval=interval, facing="user",
-                           key=f"autocam::{cid}", height=430)
-            if val is None:
-                st.info("Starting camera… allow the permission pop-up (once).")
-                return
-            if val.get("error"):
-                st.error(f"Camera error: {val['error']}")
-                st.info("If the camera is blocked inside the page, use "
-                        "**📷 Single photo** mode — same permission path, "
-                        "always works.")
-                return
-            if int(val.get("seq", 0)) == sess["last_seq"]:
-                if sess["vis"] is not None:
-                    st.image(sess["vis"], width="stretch")
-                return
-            sess["last_seq"] = int(val["seq"])
-            buf = base64.b64decode(val["frame"].split(",", 1)[1])
-            frame = cv2.imdecode(np.frombuffer(buf, np.uint8), cv2.IMREAD_COLOR)
+        @st.fragment(run_every=float(sess["interval"]))
+        def _loop():
             try:
-                vis, results, inv = _run_recognition(frame, enc, tolerance)
+                pil = camera_input_live()          # returns the latest frame
             except Exception as e:
-                st.error(f"Recognition error: {str(e)[:180]}")
+                st.error(f"Camera error: {str(e)[:160]}")
+                st.info("If the camera is blocked, use **📷 Single photo** mode.")
+                return
+            frame = cv2.cvtColor(np.asarray(pil.convert("RGB")), cv2.COLOR_RGB2BGR)
+            try:
+                vis, results, _ = _run_recognition(frame, enc, tolerance)
+            except Exception as e:
+                st.error(f"Recognition error: {str(e)[:160]}")
                 return
             sess["vis"] = vis
+            sess["captures"] += 1
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            suggestion_box(live_suggestion(
-                len(results), float(gray.mean()),
-                float(cv2.Laplacian(gray, cv2.CV_64F).var())))
+            suggestion_box(live_suggestion(len(results), float(gray.mean()),
+                                           float(cv2.Laplacian(gray, cv2.CV_64F).var())))
             st.image(vis, width="stretch")
             new_marks = _apply_marks(results, cid, sess)
             if new_marks:
                 st.toast(f"{', '.join(new_marks)} — marked", icon="🪪")
 
-        _live()
+        _loop()
+        if sess["vis"] is not None:                # persists between fragment runs
+            st.image(sess["vis"], width="stretch")
 
     with right:
         st.markdown("**Session log**")
         c1, c2, c3 = st.columns(3)
         c1.metric("Marked", len(sess["log"]))
         c2.metric("Unknown", sess["unknown"])
-        c3.metric("Captures", sess["last_seq"])       # must climb every interval
+        c3.metric("Captures", sess["captures"])
         if sess["log"]:
             st.dataframe(pd.DataFrame(sess["log"]), hide_index=True, width="stretch")
         else:
             st.caption("Recognized students appear here automatically.")
         if sess["unknown"] >= 3:
-            st.warning("Repeated unknown faces — enroll them (➕ Enroll) or add "
-                       "them to this class.")
-        if st.button("⏹️ End session", width="stretch"):
-            confirm_end_class(cid, key)
+            st.warning("Repeated unknown faces — enroll them (➕ Enroll).")
+        if st.button("⏹️ End session", type="primary", width="stretch"):
+            st.session_state[summary_key] = {
+                "log": list(sess["log"]), "unknown": sess["unknown"],
+                "captures": sess["captures"],
+                "ended": store.cfg.now().strftime("%H:%M:%S")}
+            sess.update(started=False, log=[], captures=0, unknown=0, vis=None)
+            st.rerun()
+
+
+def _render_session_summary(summary_key: str, cid: str):
+    """Post-session results card: who was marked, plus one-click absent marking."""
+    s = st.session_state[summary_key]
+    with st.container(border=True):
+        st.markdown(f"**📋 Session ended** · {s['ended']}")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Marked this session", len(s["log"]))
+        c2.metric("Unknown glimpses", s["unknown"])
+        c3.metric("Captures", s["captures"])
+        if s["log"]:
+            st.dataframe(pd.DataFrame(s["log"]), hide_index=True, width="stretch")
+        c1, c2 = st.columns(2)
+        if c1.button("🚫 Mark remaining roster absent", width="stretch",
+                     key=f"absent::{summary_key}"):
+            n = store.mark_absent_all(cid)
+            st.success(f"{n} student(s) marked Absent. Excused kept their status.")
+        if c2.button("✅ Done — hide summary", width="stretch"):
+            st.session_state.pop(summary_key, None)
+            st.rerun()
 
 
 @st.dialog("End this class?")
@@ -861,5 +797,5 @@ with st.sidebar:
     if st.button("Log out", width="stretch"):
         st.session_state.clear()
         st.rerun()
-    st.caption("v2.7 · self-hosted · data stays local")
+    st.caption("v2.8 · self-hosted · data stays local")
 pg.run()
