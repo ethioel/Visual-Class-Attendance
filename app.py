@@ -853,7 +853,7 @@ def page_students():
         capture_section(pick, pending[pick].get("name", pick), store, cfg,
                         class_targets=ms_targets)
 
-        with tab_edit:
+    with tab_edit:
         counts = store.sample_counts()
         rows = []
         for p, info in people.items():
