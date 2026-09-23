@@ -19,9 +19,8 @@ except Exception:
 
 
 def _install_fragment_noise_filter() -> None:
-    """Silence orphaned-fragment polling warnings (harmless stale-tab timers
-    after a redeploy). Covers both message variants and attaches to every
-    existing handler across root + all named loggers."""
+    """Silence orphaned-fragment polling warnings (harmless stale-tab timers).
+    Covers both message variants; attaches to every existing handler."""
     class _F(logging.Filter):
         def filter(self, record):
             m = record.getMessage()
@@ -55,7 +54,7 @@ from attendance.engine import annotate, detect_and_encode, largest_face, recogni
 from attendance.store import Store
 from attendance.ui import (STATUS_EMOJI, empty_state, face_thumb, flash, hero,
                            inject_css, render_flash, section, suggestion_box,
-                           user_chip)
+                           theme_is_dark, user_chip)
 
 st.set_page_config(page_title="Visual Attendance", page_icon="🪪", layout="wide",
                    initial_sidebar_state="collapsed")
@@ -64,7 +63,7 @@ MAIN_DB = os.environ.get("ATT_DB_DIR", "attendance_db")
 GUEST_DB = "demo_db"
 STATUS_OPTS = ["—", "Present", "Late", "Excused", "Absent"]
 WORK_WIDTH = 960          # recognition working width (px)
-LIVE_PROB = 0.85          # MTCNN prob threshold for camera frames
+LIVE_PROB = 0.85          # detector score threshold for camera frames
 
 
 @st.cache_resource
@@ -123,6 +122,201 @@ def live_suggestion(n_faces: int, brightness: float, sharpness: float) -> str:
     if n_faces > 1:
         return "👥 More than one face — keep one person in frame"
     return "✅ Perfect — hold still"
+
+
+def _app_base_url() -> str:
+    """Best-effort public URL of this app (for invite links)."""
+    try:
+        h = st.context.headers
+        host = h.get("Host") or h.get("host") or ""
+        proto = h.get("X-Forwarded-Proto") or (
+            "https" if host.endswith(".streamlit.app") else "http")
+        if host:
+            return f"{proto}://{host}"
+    except Exception:
+        pass
+    return ""
+
+
+def _render_heatmap(cid: str, month: str):
+    """Students × days grid for one month, color-coded by status."""
+    df = store.heatmap(cid, month)
+    if df.empty:
+        st.caption("No sessions recorded in this month.")
+        return
+    dates = sorted(df.Date.unique())
+    day_of = {d: d[-2:] for d in dates}
+    df["Day"] = df.Date.map(day_of)
+    names = df.Name.drop_duplicates().tolist()
+    no_rec = "#334155" if theme_is_dark() else "#E5E7EB"
+    chart = (alt.Chart(df).mark_rect(stroke="#94A3B8", strokeWidth=0.3)
+             .encode(x=alt.X("Day:O", sort=[day_of[d] for d in dates],
+                             axis=alt.Axis(labelAngle=0, title=None,
+                                           labelFontSize=9)),
+                     y=alt.Y("Name:N", sort=names, title=None),
+                     color=alt.Color("Status:N", legend=alt.Legend(
+                         orient="bottom", title=None),
+                         scale=alt.Scale(
+                             domain=["Present", "Late", "Absent", "Excused",
+                                     "No record"],
+                             range=["#16A34A", "#F59E0B", "#EF4444",
+                                    "#3B82F6", no_rec])),
+                     tooltip=["Name", "Date", "Status"])
+             .properties(height=min(26 * len(names) + 40, 520)))
+    st.altair_chart(chart, width="stretch")
+
+
+def capture_section(pid: str, name: str, store: Store, cfg: Config,
+                    class_targets: list | None = None,
+                    on_saved=None):
+    """Capture widget for one student. class_targets = classes added to on
+    save; on_saved = optional callback(pid) fired once after a successful save."""
+    class_targets = class_targets or []
+    cap = st.session_state.setdefault(f"cap::{pid}", {"samples": [], "thumbs": []})
+    run_key = f"auto::{pid}"
+    done_key = f"autodone::{pid}"
+    mode = st.radio("Capture mode",
+                    ["🎥 Auto-capture (hands-free)", "📷 Manual snapshots"],
+                    horizontal=True, key=f"cmode::{pid}")
+
+    if mode.startswith("🎥"):
+        # controls (outside fragment — full reruns are safe, fragment stays mounted)
+        if st.session_state.get(run_key):
+            if st.button("⏹️ Stop camera", width="stretch"):
+                st.session_state[run_key] = False
+                st.session_state[done_key] = False
+                st.rerun()
+        else:
+            if st.button("▶️ Start auto-capture", type="primary", width="stretch"):
+                st.session_state[run_key] = True
+                st.session_state[done_key] = False
+                st.rerun()
+
+        # fragment ALWAYS mounted in this mode; body gates on flags → no orphan timers
+        @st.fragment(run_every=3.0)
+        def _auto():
+            if st.session_state.get(done_key):
+                suggestion_box("✅ All samples captured — press Save below.")
+                return
+            if not st.session_state.get(run_key):
+                st.caption("📷 Camera off — press ▶️ Start auto-capture.")
+                return
+            try:
+                frame = camera_frame_bgr()
+            except Exception as e:
+                st.error(f"Camera error: {str(e)[:160]}")
+                return
+            if frame is None:
+                st.info("Starting camera… allow the permission pop-up (once).")
+                return
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            bright, sharp = float(gray.mean()), float(cv2.Laplacian(gray, cv2.CV_64F).var())
+            try:
+                locs, encs = detect_and_encode(rgb, scale=1.0,
+                                               num_jitters=cfg.enroll_jitters)
+            except Exception as e:
+                st.error(f"Recognition error: {str(e)[:160]}")
+                return
+            n = len(cap["samples"])
+            if n < cfg.n_samples:
+                good = (len(locs) == 1 and 55 <= bright <= 210 and sharp >= 30)
+                if good and time.time() - st.session_state.get(f"lc::{pid}", 0) > 2.5:
+                    cap["samples"].append(encs[0])
+                    cap["thumbs"].append(face_thumb(rgb, locs[0], 72))
+                    st.session_state[f"lc::{pid}"] = time.time()
+                    n += 1
+                    st.toast(f"Sample {n}/{cfg.n_samples} captured", icon="📸")
+                suggestion_box(live_suggestion(len(locs), bright, sharp))
+            else:
+                # done: stop camera inside the fragment, flip flags
+                st.session_state[run_key] = False
+                st.session_state[done_key] = True
+                st.rerun()
+            st.progress(min(n / cfg.n_samples, 1.0),
+                        text=f"{n}/{cfg.n_samples} samples captured")
+            th = st.columns(5)
+            for i, tmb in enumerate(cap["thumbs"]):
+                th[i % 5].image(tmb, width="stretch")
+
+        _auto()
+    else:
+        left, right = st.columns([3, 2])
+        with left:
+            shot = st.camera_input("Capture a sample — vary angle & lighting",
+                                   key=f"man::{pid}::{len(cap['samples'])}")
+            if shot is not None:
+                rgb = to_rgb(shot)
+                locs, encs = detect_and_encode(rgb, scale=1.0,
+                                               num_jitters=cfg.enroll_jitters)
+                box = largest_face(locs)
+                if box is None:
+                    st.error("No face detected — improve lighting and retake.")
+                else:
+                    cap["samples"].append(encs[locs.index(box)])
+                    cap["thumbs"].append(face_thumb(rgb, box, 72))
+                    st.rerun()
+        with right:
+            th = st.columns(5)
+            for i, tmb in enumerate(cap["thumbs"]):
+                th[i % 5].image(tmb, width="stretch")
+
+    if cap["samples"]:
+        st.progress(min(len(cap["samples"]) / cfg.n_samples, 1.0),
+                    text=f"{len(cap['samples'])}/{cfg.n_samples} samples captured")
+        if st.button(f"💾 Save {len(cap['samples'])} sample(s) for {name or pid}",
+                     type="primary", width="stretch"):
+            store.enroll(pid, name or pid, cap["samples"])
+            added = [t for t in class_targets if store.add_to_class(t, pid)]
+            st.session_state.pop(f"cap::{pid}", None)
+            st.session_state.pop(run_key, None)
+            st.session_state.pop(done_key, None)
+            msg = f"Saved **{name or pid}** with {len(cap['samples'])} samples."
+            if added:
+                msg += f" Added to: {', '.join(added)}."
+            elif class_targets:
+                msg += " (Class selection was cleared — re-select if needed.)"
+            flash("success" if added else "warning", msg)
+            if on_saved:
+                on_saved(pid)
+            st.rerun()
+
+
+# ================= INVITE SELF-ENROLL (pre-login) =================
+_invite = st.query_params.get("invite")
+if _invite and "user" not in st.session_state:
+    inject_css(hide_sidebar=True)
+    icfg, istore, _ = resources(MAIN_DB)
+    icid = istore.class_by_invite(_invite)
+    render_flash()
+    if not icid:
+        empty_state("🔗", "Invalid invite link",
+                    "It may have been regenerated — ask your teacher for a "
+                    "fresh link.")
+    else:
+        icls = istore.load_classes()[icid]
+        if st.session_state.pop("invite_done", False):
+            st.title(f"🪪 {icls['name']}")
+            st.success("🎉 You're enrolled! Your teacher can now see you in "
+                       "the class list.")
+            st.caption("You can close this page.")
+            st.stop()
+        st.title(f"🪪 Join {icls['name']}")
+        st.caption("Enter your details and capture your face samples — after "
+                   "saving, you're automatically on the class list.")
+        c1, c2 = st.columns(2)
+        pid = c1.text_input("Student ID (if you don't have one, make up a "
+                            "unique one, e.g. abebe-k)", key="inv_pid")
+        name = c2.text_input("Full name", key="inv_name")
+        if pid.strip() and name.strip():
+            if pid.strip() in istore.load_people():
+                st.info("You're already registered — new samples will be added "
+                        "to your profile.")
+            capture_section(pid.strip(), name.strip(), istore, icfg,
+                            class_targets=[icid],
+                            on_saved=lambda p: st.session_state.__setitem__(
+                                "invite_done", True))
+    st.stop()
 
 
 # ================= LOGIN =================
@@ -262,6 +456,9 @@ def _class_readiness_card(cid: str, cls: dict):
             PAGES.get("Enroll student") and st.page_link(
                 PAGES["Enroll student"],
                 label="➕ …or enroll a new student (select this class)", icon="➕")
+            PAGES.get("Classes") and st.page_link(
+                PAGES["Classes" if user["role"] == "admin" else "My classes"],
+                label="🔗 …or share the class invite link", icon="🔗")
         return
     missing = [p for p in students if p not in enc_all]
     if missing:
@@ -531,121 +728,6 @@ def _single_photo(cid: str, cls: dict, enc: dict, tolerance: float):
 
 
 # ================= ENROLL =================
-def capture_section(pid: str, name: str, store: Store, cfg: Config,
-                    class_targets: list | None = None):
-    """Capture widget for one student. class_targets = classes the student is
-    added to on save."""
-    class_targets = class_targets or []
-    cap = st.session_state.setdefault(f"cap::{pid}", {"samples": [], "thumbs": []})
-    run_key = f"auto::{pid}"
-    done_key = f"autodone::{pid}"
-    mode = st.radio("Capture mode",
-                    ["🎥 Auto-capture (hands-free)", "📷 Manual snapshots"],
-                    horizontal=True, key=f"cmode::{pid}")
-
-    if mode.startswith("🎥"):
-        # controls (outside fragment — full reruns are safe, fragment stays mounted)
-        if st.session_state.get(run_key):
-            if st.button("⏹️ Stop camera", width="stretch"):
-                st.session_state[run_key] = False
-                st.session_state[done_key] = False
-                st.rerun()
-        else:
-            if st.button("▶️ Start auto-capture", type="primary", width="stretch"):
-                st.session_state[run_key] = True
-                st.session_state[done_key] = False
-                st.rerun()
-
-        # fragment ALWAYS mounted in this mode; body gates on flags → no orphan timers
-        @st.fragment(run_every=3.0)
-        def _auto():
-            if st.session_state.get(done_key):
-                suggestion_box("✅ All samples captured — press Save below.")
-                return
-            if not st.session_state.get(run_key):
-                st.caption("📷 Camera off — press ▶️ Start auto-capture.")
-                return
-            try:
-                frame = camera_frame_bgr()
-            except Exception as e:
-                st.error(f"Camera error: {str(e)[:160]}")
-                return
-            if frame is None:
-                st.info("Starting camera… allow the permission pop-up (once).")
-                return
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            bright, sharp = float(gray.mean()), float(cv2.Laplacian(gray, cv2.CV_64F).var())
-            try:
-                locs, encs = detect_and_encode(rgb, scale=1.0,
-                                               num_jitters=cfg.enroll_jitters)
-            except Exception as e:
-                st.error(f"Recognition error: {str(e)[:160]}")
-                return
-            n = len(cap["samples"])
-            if n < cfg.n_samples:
-                good = (len(locs) == 1 and 55 <= bright <= 210 and sharp >= 30)
-                if good and time.time() - st.session_state.get(f"lc::{pid}", 0) > 2.5:
-                    cap["samples"].append(encs[0])
-                    cap["thumbs"].append(face_thumb(rgb, locs[0], 72))
-                    st.session_state[f"lc::{pid}"] = time.time()
-                    n += 1
-                    st.toast(f"Sample {n}/{cfg.n_samples} captured", icon="📸")
-                suggestion_box(live_suggestion(len(locs), bright, sharp))
-            else:
-                # done: stop camera inside the fragment, flip flags
-                st.session_state[run_key] = False
-                st.session_state[done_key] = True
-                st.rerun()
-            st.progress(min(n / cfg.n_samples, 1.0),
-                        text=f"{n}/{cfg.n_samples} samples captured")
-            th = st.columns(5)
-            for i, tmb in enumerate(cap["thumbs"]):
-                th[i % 5].image(tmb, width="stretch")
-
-        _auto()
-    else:
-        left, right = st.columns([3, 2])
-        with left:
-            shot = st.camera_input("Capture a sample — vary angle & lighting",
-                                   key=f"man::{pid}::{len(cap['samples'])}")
-            if shot is not None:
-                rgb = to_rgb(shot)
-                locs, encs = detect_and_encode(rgb, scale=1.0,
-                                               num_jitters=cfg.enroll_jitters)
-                box = largest_face(locs)
-                if box is None:
-                    st.error("No face detected — improve lighting and retake.")
-                else:
-                    cap["samples"].append(encs[locs.index(box)])
-                    cap["thumbs"].append(face_thumb(rgb, box, 72))
-                    st.rerun()
-        with right:
-            th = st.columns(5)
-            for i, tmb in enumerate(cap["thumbs"]):
-                th[i % 5].image(tmb, width="stretch")
-
-    if cap["samples"]:
-        st.progress(min(len(cap["samples"]) / cfg.n_samples, 1.0),
-                    text=f"{len(cap['samples'])}/{cfg.n_samples} samples captured")
-        if st.button(f"💾 Save {len(cap['samples'])} sample(s) for {name or pid}",
-                     type="primary", width="stretch"):
-            store.enroll(pid, name or pid, cap["samples"])
-            added = [t for t in class_targets if store.add_to_class(t, pid)]
-            st.session_state.pop(f"cap::{pid}", None)
-            st.session_state.pop(run_key, None)
-            st.session_state.pop(done_key, None)
-            msg = f"Saved **{name or pid}** with {len(cap['samples'])} samples."
-            if added:
-                msg += f" Added to: {', '.join(added)}."
-            elif class_targets:
-                msg += " (Class selection was cleared — re-select if needed.)"
-            else:
-                msg += " ⚠️ Not added to any class — pick one above next time."
-            flash("success" if added else "warning", msg)
-            st.rerun()
-
-
 def page_enroll():
     section("➕", "Enroll student")
     c1, c2, c3 = st.columns(3)
@@ -837,6 +919,20 @@ def class_card(cid: str, cls: dict, show_teacher: bool):
         c3.metric("Late after", cls.get("late_after") or "—")
         if show_teacher:
             st.caption(f"Teacher: **{cls['teacher']}**")
+
+        with st.expander("🔗 Invite link (students self-enroll)"):
+            code = store.ensure_class_invite(cid)
+            st.code(code or "—", language=None)
+            base = _app_base_url()
+            if base and code:
+                st.code(f"{base}/?invite={code}", language=None)
+            st.caption("Students open the link (or add `?invite=CODE` to your "
+                       "app URL) and enroll themselves into this class — no "
+                       "account needed. Regenerate to invalidate old links.")
+            if st.button("♻️ Regenerate code", key=f"regen::{cid}"):
+                store.regenerate_invite(cid)
+                st.rerun()
+
         with st.expander("📈 Attendance rates"):
             r = rate_table(cid)
             if r.empty:
@@ -847,6 +943,15 @@ def class_card(cid: str, cls: dict, show_teacher: bool):
                              column_config={"Rate": st.column_config.ProgressColumn(
                                  "Attendance", min_value=0, max_value=100,
                                  format="%.0f%%")})
+
+        with st.expander("🗓️ Monthly heatmap"):
+            months = sorted({d[:7] for d in store.records_df(cid).Date.unique()},
+                            reverse=True)
+            if not months:
+                st.caption("No sessions recorded yet.")
+            else:
+                month = st.selectbox("Month", months, key=f"hm::{cid}")
+                _render_heatmap(cid, month)
 
 
 def page_classes():
@@ -1007,5 +1112,5 @@ with st.sidebar:
     if st.button("Log out", width="stretch"):
         st.session_state.clear()
         st.rerun()
-    st.caption("v2.10 · self-hosted · data stays local")
+    st.caption("v2.11 · self-hosted · data stays local")
 pg.run()
