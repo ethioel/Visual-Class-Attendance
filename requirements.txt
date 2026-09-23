@@ -1,11 +1,9 @@
---extra-index-url https://download.pytorch.org/whl/cpu
 streamlit>=1.49
 numpy>=1.26,<2.0
 pandas>=2.0
 opencv-python-headless>=4.9,<5
+onnxruntime>=1.17
 openpyxl>=3.1
 huggingface_hub>=0.23
-torch==2.2.2+cpu
-torchvision==0.17.2+cpu
-facenet-pytorch==2.6.0
+pillow>=10
 streamlit-camera-input-live>=0.0.3
