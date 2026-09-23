@@ -25,7 +25,7 @@ _ARCFACE_URLS = [
     "https://huggingface.co/facefusion/models-3.0.0/resolve/main/arcface_w600k_r50.onnx",
 ]
 
-_BACKEND = None  # lazy singleton: {"yunet": path, "sess", "in", "out"}
+_BACKEND = None  # lazy singleton: {"cv2", "yunet", "sess", "in", "out"}
 
 
 def _download(urls: List[str], dest: str, min_size: int) -> str:
