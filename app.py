@@ -853,22 +853,40 @@ def page_students():
         capture_section(pick, pending[pick].get("name", pick), store, cfg,
                         class_targets=ms_targets)
 
-    with tab_edit:
+        with tab_edit:
         counts = store.sample_counts()
-        base = pd.DataFrame([{"ID": p, "Name": info.get("name", p),
-                              "Samples": counts.get(p, 0)}
-                             for p, info in people.items()])
+        rows = []
+        for p, info in people.items():
+            n = counts.get(p, 0)
+            if n >= cfg.n_samples:
+                status = "✅ Ready"
+            elif n > 0:
+                status = "🟡 Partial — add more samples"
+            elif info.get("backend"):            # stamped but zero current samples
+                status = "🔴 Needs recapture (model updated)"
+            else:
+                status = "⚪ No face samples"
+            rows.append({"ID": p, "Name": info.get("name", p),
+                         "Samples": n, "Status": status})
+        base = pd.DataFrame(rows)
         if base.empty:
-            empty_state("👥", "No students yet", "Enroll or import students first.")
+            empty_state("👥", "No students yet",
+                        "Enroll, import, or share a class invite link.")
             return
-        ed = st.data_editor(base, disabled=["ID", "Samples"], hide_index=True,
-                            width="stretch", num_rows="fixed", key="edit_people")
+        st.caption(f"**{len(base)}** student(s) total · "
+                   f"{(base.Samples >= cfg.n_samples).sum()} ready for recognition")
+        show = st.selectbox("Show", ["All students", "Only those needing samples"],
+                            key="edit_filter")
+        view = base if show == "All students" else base[base.Samples < cfg.n_samples]
+        ed = st.data_editor(view, disabled=["ID", "Samples", "Status"],
+                            hide_index=True, width="stretch",
+                            num_rows="fixed", key="edit_people")
         if st.button("💾 Save name changes"):
-            n = sum(1 for (_, a), (_, b) in zip(base.iterrows(), ed.iterrows())
-                    if a["Name"] != b["Name"])
-            for (_, a), (_, b) in zip(base.iterrows(), ed.iterrows()):
-                if a["Name"] != b["Name"]:
-                    store.rename_person(a["ID"], b["Name"])
+            n = 0
+            for _, row in ed.iterrows():
+                if row["Name"] != base.loc[base.ID == row["ID"], "Name"].iloc[0]:
+                    store.rename_person(row["ID"], row["Name"])
+                    n += 1
             flash("success" if n else "info",
                   f"Renamed {n} student(s)." if n else "No changes to apply.")
             st.rerun()
