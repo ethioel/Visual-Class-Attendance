@@ -18,16 +18,34 @@ except Exception:
     pass
 
 
-class _FragmentNoise(logging.Filter):
-    """Silence orphaned-fragment polling warnings (harmless client timers)."""
-    def filter(self, record):
-        return "does not exist anymore" not in record.getMessage()
+def _install_fragment_noise_filter() -> None:
+    """Silence orphaned-fragment polling warnings (harmless stale-tab timers
+    after a redeploy). Covers both message variants and attaches to every
+    existing handler across root + all named loggers."""
+    class _F(logging.Filter):
+        def filter(self, record):
+            m = record.getMessage()
+            return ("does not exist anymore" not in m
+                    and "Couldn't find fragment" not in m)
+
+    seen = set()
+
+    def attach(lg: logging.Logger) -> None:
+        if id(lg) in seen:
+            return
+        seen.add(id(lg))
+        for h in lg.handlers:
+            h.addFilter(_F())
+
+    names = ["", "streamlit"] + list(logging.root.manager.loggerDict)
+    for name in names:
+        try:
+            attach(logging.getLogger(name))
+        except Exception:
+            pass
 
 
-_l = logging.getLogger("streamlit")
-_l.addFilter(_FragmentNoise())
-for _h in _l.handlers:
-    _h.addFilter(_FragmentNoise())
+_install_fragment_noise_filter()
 
 from camera_input_live import camera_input_live
 
