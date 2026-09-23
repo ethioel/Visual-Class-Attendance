@@ -47,8 +47,9 @@ def resources(db_dir: str):
 def to_rgb(upload) -> np.ndarray:
     arr = np.frombuffer(upload.getvalue(), np.uint8)
     bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if btr is None:                                    # guarded below; see to_rgb
-        pass
+    if bgr is None:
+        st.error("Could not decode image — retake.")
+        st.stop()
     return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
 
