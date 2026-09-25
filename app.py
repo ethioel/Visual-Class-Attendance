@@ -9,6 +9,7 @@ import cv2
 import numpy as np
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from PIL import Image
 
 try:
@@ -19,25 +20,20 @@ except Exception:
 
 
 def _install_fragment_noise_filter() -> None:
-    """Silence orphaned-fragment polling warnings (harmless stale-tab timers).
-    Covers both message variants; attaches to every existing handler."""
     class _F(logging.Filter):
         def filter(self, record):
             m = record.getMessage()
             return ("does not exist anymore" not in m
                     and "Couldn't find fragment" not in m)
-
     seen = set()
 
-    def attach(lg: logging.Logger) -> None:
+    def attach(lg):
         if id(lg) in seen:
             return
         seen.add(id(lg))
         for h in lg.handlers:
             h.addFilter(_F())
-
-    names = ["", "streamlit"] + list(logging.root.manager.loggerDict)
-    for name in names:
+    for name in ["", "streamlit"] + list(logging.root.manager.loggerDict):
         try:
             attach(logging.getLogger(name))
         except Exception:
@@ -50,11 +46,12 @@ from camera_input_live import camera_input_live
 
 from attendance.auth import Auth
 from attendance.config import Config
-from attendance.engine import annotate, detect_and_encode, largest_face, recognize
+from attendance.engine import (annotate, best_match, detect_and_encode,
+                               largest_face, recognize)
 from attendance.store import Store
-from attendance.ui import (STATUS_EMOJI, empty_state, face_thumb, flash, hero,
-                           inject_css, render_flash, section, suggestion_box,
-                           theme_is_dark, user_chip)
+from attendance.ui import (STATUS_EMOJI, empty_data_hero, empty_state,
+                           face_thumb, flash, hero, inject_css, render_flash,
+                           section, suggestion_box, theme_is_dark, user_chip)
 
 st.set_page_config(page_title="Visual Attendance", page_icon="🪪", layout="wide",
                    initial_sidebar_state="collapsed")
@@ -62,15 +59,16 @@ st.set_page_config(page_title="Visual Attendance", page_icon="🪪", layout="wid
 MAIN_DB = os.environ.get("ATT_DB_DIR", "attendance_db")
 GUEST_DB = "demo_db"
 STATUS_OPTS = ["—", "Present", "Late", "Excused", "Absent"]
-WORK_WIDTH = 960          # recognition working width (px)
-LIVE_PROB = 0.85          # detector score threshold for camera frames
+WORK_WIDTH = 960
+LIVE_PROB = 0.85
+VIS_W = 640                      # downscaled annotated frame in live loop
 
 
 @st.cache_resource
 def resources(db_dir: str):
     cfg = Config(db_dir=db_dir)
     store, auth = Store(cfg), Auth(cfg)
-    tz = store.get_settings().get("timezone")          # UI setting > env > system
+    tz = store.get_settings().get("timezone")
     if tz:
         cfg.timezone = tz
     return cfg, store, auth
@@ -85,14 +83,11 @@ def to_rgb(upload) -> np.ndarray:
     return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
 
-def camera_frame_bgr() -> np.ndarray | None:
-    """Latest frame from the live camera element as BGR ndarray (None if not
-    ready). Handles every return type the library has used across versions
-    (BytesIO / data-URL string / PIL Image)."""
+def camera_frame_bgr():
     raw = camera_input_live()
     if raw is None:
         return None
-    if isinstance(raw, str):                       # data URL
+    if isinstance(raw, str):
         raw = BytesIO(base64.b64decode(raw.split(",", 1)[1]))
     elif isinstance(raw, (bytes, bytearray)):
         raw = BytesIO(raw)
@@ -101,8 +96,6 @@ def camera_frame_bgr() -> np.ndarray | None:
 
 
 def to_working(rgb, max_w: int = WORK_WIDTH):
-    """Resize to a fixed working width; return (image, inv) where
-    original = image * inv."""
     h, w = rgb.shape[:2]
     if w > max_w:
         s = max_w / w
@@ -110,7 +103,7 @@ def to_working(rgb, max_w: int = WORK_WIDTH):
     return rgb, 1.0
 
 
-def live_suggestion(n_faces: int, brightness: float, sharpness: float) -> str:
+def live_suggestion(n_faces, brightness, sharpness):
     if brightness < 55:
         return "☀️ Too dark — face a light"
     if brightness > 210:
@@ -125,7 +118,6 @@ def live_suggestion(n_faces: int, brightness: float, sharpness: float) -> str:
 
 
 def _app_base_url() -> str:
-    """Best-effort public URL of this app (for invite links)."""
     try:
         h = st.context.headers
         host = h.get("Host") or h.get("host") or ""
@@ -139,7 +131,6 @@ def _app_base_url() -> str:
 
 
 def _render_heatmap(cid: str, month: str):
-    """Students × days grid for one month, color-coded by status."""
     df = store.heatmap(cid, month)
     if df.empty:
         st.caption("No sessions recorded in this month.")
@@ -167,10 +158,8 @@ def _render_heatmap(cid: str, month: str):
 
 
 def capture_section(pid: str, name: str, store: Store, cfg: Config,
-                    class_targets: list | None = None,
-                    on_saved=None):
-    """Capture widget for one student. class_targets = classes added to on
-    save; on_saved = optional callback(pid) fired once after a successful save."""
+                    class_targets=None, on_saved=None):
+    """Capture widget with per-sample ✕ delete (retake-friendly)."""
     class_targets = class_targets or []
     cap = st.session_state.setdefault(f"cap::{pid}", {"samples": [], "thumbs": []})
     run_key = f"auto::{pid}"
@@ -179,8 +168,20 @@ def capture_section(pid: str, name: str, store: Store, cfg: Config,
                     ["🎥 Auto-capture (hands-free)", "📷 Manual snapshots"],
                     horizontal=True, key=f"cmode::{pid}")
 
+    def _thumb_row():
+        if not cap["thumbs"]:
+            return
+        cols = st.columns(5)
+        for i, tmb in enumerate(cap["thumbs"]):
+            with cols[i % 5]:
+                st.image(tmb, width="stretch")
+                if st.button("✕ Remove", key=f"x::{pid}::{i}",
+                             help="Delete this sample — retake to replace"):
+                    cap["samples"].pop(i)
+                    cap["thumbs"].pop(i)
+                    st.rerun()
+
     if mode.startswith("🎥"):
-        # controls (outside fragment — full reruns are safe, fragment stays mounted)
         if st.session_state.get(run_key):
             if st.button("⏹️ Stop camera", width="stretch"):
                 st.session_state[run_key] = False
@@ -192,11 +193,10 @@ def capture_section(pid: str, name: str, store: Store, cfg: Config,
                 st.session_state[done_key] = False
                 st.rerun()
 
-        # fragment ALWAYS mounted in this mode; body gates on flags → no orphan timers
         @st.fragment(run_every=3.0)
         def _auto():
             if st.session_state.get(done_key):
-                suggestion_box("✅ All samples captured — press Save below.")
+                suggestion_box("✅ All samples captured — review below, then Save.")
                 return
             if not st.session_state.get(run_key):
                 st.caption("📷 Camera off — press ▶️ Start auto-capture.")
@@ -229,17 +229,14 @@ def capture_section(pid: str, name: str, store: Store, cfg: Config,
                     st.toast(f"Sample {n}/{cfg.n_samples} captured", icon="📸")
                 suggestion_box(live_suggestion(len(locs), bright, sharp))
             else:
-                # done: stop camera inside the fragment, flip flags
                 st.session_state[run_key] = False
                 st.session_state[done_key] = True
                 st.rerun()
             st.progress(min(n / cfg.n_samples, 1.0),
                         text=f"{n}/{cfg.n_samples} samples captured")
-            th = st.columns(5)
-            for i, tmb in enumerate(cap["thumbs"]):
-                th[i % 5].image(tmb, width="stretch")
 
         _auto()
+        _thumb_row()
     else:
         left, right = st.columns([3, 2])
         with left:
@@ -257,9 +254,7 @@ def capture_section(pid: str, name: str, store: Store, cfg: Config,
                     cap["thumbs"].append(face_thumb(rgb, box, 72))
                     st.rerun()
         with right:
-            th = st.columns(5)
-            for i, tmb in enumerate(cap["thumbs"]):
-                th[i % 5].image(tmb, width="stretch")
+            _thumb_row()
 
     if cap["samples"]:
         st.progress(min(len(cap["samples"]) / cfg.n_samples, 1.0),
@@ -274,8 +269,6 @@ def capture_section(pid: str, name: str, store: Store, cfg: Config,
             msg = f"Saved **{name or pid}** with {len(cap['samples'])} samples."
             if added:
                 msg += f" Added to: {', '.join(added)}."
-            elif class_targets:
-                msg += " (Class selection was cleared — re-select if needed.)"
             flash("success" if added else "warning", msg)
             if on_saved:
                 on_saved(pid)
@@ -341,8 +334,7 @@ if "user" not in st.session_state:
                 if st.button("👀 Continue as guest (demo sandbox)", width="stretch"):
                     st.session_state.user = {"username": "guest", "role": "guest"}
                     st.rerun()
-        st.caption("Teachers get accounts from the admin. Students never sign in. "
-                   "🌓 Dark mode: ⋮ menu → Settings → Theme.")
+        st.caption("Teachers get accounts from the admin. Students never sign in.")
     st.stop()
 
 # ================= SESSION =================
@@ -360,6 +352,8 @@ classes = (store.load_classes() if user["role"] in ("admin", "guest")
 people = store.load_people()
 enc_all = store.load_encodings()
 
+ACTOR = user["username"]
+
 
 def scope_records() -> pd.DataFrame:
     df = store.records_df()
@@ -373,11 +367,23 @@ def rate_table(cid: str) -> pd.DataFrame:
     return r
 
 
-# ================= DASHBOARD =================
+# ================= DASHBOARD (with first-run hero) =================
 def page_dashboard():
     section("📊", "Dashboard")
     if guest:
         st.info("Demo sandbox — everything resets when the app sleeps.", icon="🧪")
+
+    # First-run: nothing configured at all
+    if not people and not classes and scope_records().empty:
+        empty_data_hero(
+            "Welcome — let's set up your first class",
+            ["Create a class (🏫 Classes → ➕ Create class).",
+             "Share its invite link, or enroll students yourself (➕ Enroll).",
+             "Start a live session in ✅ Take attendance — students walk in "
+             "and get marked automatically."],
+            cta_label="🏫 Create your first class",
+            cta_page="Classes")
+        return
 
     @st.fragment(run_every="60s")
     def live_panel():
@@ -431,13 +437,12 @@ def page_dashboard():
                      .properties(height=280))
             st.altair_chart(chart, width="stretch")
         else:
-            empty_state("📉", "No records yet", "Take attendance to populate the chart.")
+            empty_state("📉", "No records yet",
+                        "Run your first live session — the chart fills itself.")
 
 
 # ================= ATTENDANCE =================
 def _class_readiness_card(cid: str, cls: dict):
-    """Plain-language readiness: who's in the class, who still needs face
-    samples — with one-click fixes for both."""
     students = cls.get("students", [])
     if not students:
         with st.container(border=True):
@@ -452,6 +457,7 @@ def _class_readiness_card(cid: str, cls: dict):
                                       type="primary"):
                     for p in pick:
                         store.add_to_class(cid, p)
+                        store._audit(ACTOR, "add_to_class", f"{cid}/{p}")
                     st.rerun()
             PAGES.get("Enroll student") and st.page_link(
                 PAGES["Enroll student"],
@@ -477,26 +483,59 @@ def _class_readiness_card(cid: str, cls: dict):
 def page_attendance():
     section("✅", "Take attendance")
     if not classes:
-        empty_state("🏫", "No classes yet", "Create a class first, then scan its students.")
+        empty_data_hero(
+            "No classes yet",
+            ["Create a class (🏫 Classes → ➕ Create class).",
+             "Add students: share the invite link, enroll manually, or "
+             "import a roster (👥 Students).",
+             "Come back here and start a live session."],
+            cta_label="🏫 Create your first class", cta_page="Classes")
         return
     cid = st.selectbox("Class", list(classes),
                        format_func=lambda c: f"{classes[c]['name']} · {c}")
     cls = classes[cid]
+
+    cL1, cL2, cL3 = st.columns([2, 2, 3])
+    cur = cls.get("late_after") or ""
+    hh, mm = (cur.split(":") + ["00"])[:2] if cur else ("09", "00")
+    import datetime as _dt
+    try:
+        late_val = cL2.time_input("Late after (marks from this time = Late)",
+                                  value=_dt.time(int(hh), int(mm)),
+                                  key=f"late::{cid}")
+        late_str = late_val.strftime("%H:%M")
+    except Exception:
+        late_str = cur
+    if late_str != cur and cL1.button("💾 Save late time", width="stretch"):
+        store.update_class(cid, {"late_after": late_str})
+        cls["late_after"] = late_str
+        store._audit(ACTOR, "set_late", f"{cid}={late_str}")
+        flash("success", f"Late time set to **{late_str}** — scans below use "
+              "it instantly.")
+        st.rerun()
+    cL3.caption(f"Current: **{cur or 'off (all marks = Present)'}**")
+
     enc = {p: enc_all[p] for p in cls.get("students", []) if p in enc_all}
     _class_readiness_card(cid, cls)
-    tolerance = st.slider("Match tolerance (lower = stricter)", 0.60, 1.40,
-                          cfg.tolerance, 0.01)
+    if not enc:
+        return
+
+    with st.popover("⚙️ Scan settings"):
+        tolerance = st.slider("Match tolerance (lower = stricter)", 0.60, 1.40,
+                              cfg.tolerance, 0.01)
+        liveness = st.slider("Liveness strictness (0 = off)", 0.0, 1.0, 0.35, 0.05,
+                             help="Requires visible motion between frames — "
+                             "defeats holding up a still photo.")
     mode = st.radio("Scan mode", ["🎥 Live auto-scan (hands-free)", "📷 Single photo"],
                     horizontal=True, key="scan_mode")
 
     if mode.startswith("🎥"):
-        _live_session(cid, cls, enc, tolerance)
+        _live_session(cid, cls, enc, tolerance, liveness)
     else:
         _single_photo(cid, cls, enc, tolerance)
 
-    # ---- editable statuses (incl. Excused) ----
     st.divider()
-    st.markdown("**✏️ Today's statuses — edit manually**")
+    st.markdown("**✏️ Today's statuses — edit or delete marks**")
     t = store.today_df(cid)
     smap = {r.ID: r.Status for r in t.itertuples()} if not t.empty else {}
     base = pd.DataFrame([{"ID": p, "Name": people.get(p, {}).get("name", p),
@@ -505,16 +544,19 @@ def page_attendance():
     if base.empty:
         st.caption("This class has no students yet.")
     else:
+        st.caption("Set a student to **—** to delete today's mark.")
         ed = st.data_editor(base, disabled=["ID", "Name"], hide_index=True,
                             width="stretch", key=f"ed::{cid}",
                             column_config={"Status": st.column_config.SelectboxColumn(
                                 "Status", options=STATUS_OPTS)})
-        if st.button("💾 Apply status changes"):
+        if st.button("💾 Apply changes"):
             n = 0
             for (_, a), (_, b) in zip(base.iterrows(), ed.iterrows()):
                 if a["Status"] != b["Status"]:
                     store.set_status(a["ID"], a["Name"],
                                      None if b["Status"] == "—" else b["Status"], cid)
+                    store._audit(ACTOR, "set_status",
+                                 f"{cid}/{a['ID']}={b['Status']}")
                     n += 1
             flash("success" if n else "info",
                   f"Updated {n} record(s)." if n else "No changes to apply.")
@@ -522,8 +564,6 @@ def page_attendance():
 
 
 def _run_recognition(frame_bgr, enc: dict, tolerance: float):
-    """Shared recognition path. Returns (annotated_rgb, results, inv) —
-    boxes are in WORK coords; multiply by inv for original-image coords."""
     rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     work, inv = to_working(rgb)
     results = recognize(work, enc, tolerance=tolerance, scale=1.0,
@@ -533,15 +573,19 @@ def _run_recognition(frame_bgr, enc: dict, tolerance: float):
     return vis, results, inv
 
 
-def _apply_marks(results, cid: str, sess: dict):
-    """Mark known faces, update the session log. Returns new names."""
+def _apply_marks(results, cid: str, sess: dict, live_ok: bool):
+    """Mark known faces. If liveness is on and live_ok is False, no auto-marks
+    this tick (UI shows why). Manual check-in still available."""
     status = store.status_now(classes[cid].get("late_after"))
     new_marks, any_unknown = [], False
     for box, label, known, dist in results:
         if known:
+            if not live_ok:
+                continue
             nm = people.get(label, {}).get("name", label)
             if store.mark(label, nm, status, cid):
                 new_marks.append(nm)
+                store._audit(ACTOR, "mark_live", f"{cid}/{label}={status}")
             if not any(r["ID"] == label for r in sess["log"]):
                 sess["log"].insert(0, {"Name": nm, "ID": label,
                                        "Status": STATUS_EMOJI.get(status, status),
@@ -552,14 +596,13 @@ def _apply_marks(results, cid: str, sess: dict):
     return new_marks
 
 
-def _live_session(cid: str, cls: dict, enc: dict, tolerance: float):
-    """Start/Stop live session. The recognition fragment is ALWAYS mounted
-    while this section renders; its body gates on sess['started'] — so timers
-    never outlive the fragment (no orphan warnings)."""
+def _live_session(cid: str, cls: dict, enc: dict, tolerance: float,
+                  liveness: float):
     key = f"session::{cid}"
     sess = st.session_state.setdefault(key, {"started": False, "log": [],
                                              "captures": 0, "unknown": 0,
-                                             "vis": None, "interval": 5})
+                                             "last_emb": None,
+                                             "last_mark_t": 0.0})
     summary_key = f"summary::{cid}"
     status = store.status_now(cls.get("late_after"))
     if not enc:
@@ -573,16 +616,16 @@ def _live_session(cid: str, cls: dict, enc: dict, tolerance: float):
                 _render_session_summary(summary_key, cid)
             with st.container(border=True):
                 st.markdown("**🎥 Live auto-scan**")
-                st.caption(f"Walk-through marking · {len(enc)} students ready · "
-                           f"new scans mark as **{status}**.")
+                st.caption(f"{len(enc)} students ready · marks as **{status}**"
+                           + (" · 🛡️ liveness ON" if liveness > 0 else ""))
                 sess["interval"] = st.select_slider(
                     "Capture interval", options=[3, 5, 8],
                     value=sess.get("interval", 5),
                     format_func=lambda v: f"every {v}s")
                 if st.button("▶️ Start live session", type="primary",
                              width="stretch"):
-                    sess.update(started=True, log=[], captures=0,
-                                unknown=0, vis=None)
+                    sess.update(started=True, log=[], captures=0, unknown=0,
+                                last_emb=None)
                     st.session_state.pop(summary_key, None)
                     st.rerun()
 
@@ -601,23 +644,45 @@ def _live_session(cid: str, cls: dict, enc: dict, tolerance: float):
                 st.info("Starting camera… allow the permission pop-up (once).")
                 return
             try:
-                vis, results, _ = _run_recognition(frame, enc, tolerance)
+                # --- recognition ---
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                work, _ = to_working(rgb)
+                locs, encs = detect_and_encode(work, scale=1.0,
+                                               prob_threshold=LIVE_PROB)
+                # --- liveness: embedding must differ from previous frame ---
+                live_ok = True
+                if liveness > 0 and encs:
+                    ref = sess.get("last_emb")
+                    if ref is not None:
+                        d = float(np.linalg.norm(
+                            np.asarray(encs[0]) - np.asarray(ref)))
+                        live_ok = d >= (0.02 + 0.10 * (1.0 - liveness))
+                    sess["last_emb"] = encs[0]
+                results = []
+                for box, e in zip(locs, encs):
+                    pid, dist = best_match(e, enc, tolerance=tolerance)
+                    results.append((box, pid, True, dist) if pid
+                                   else (box, f"Unknown ({dist:.2f})", False, dist))
+                sess["captures"] += 1
             except Exception as e:
                 st.error(f"Recognition error: {str(e)[:160]}")
                 return
-            sess["vis"] = vis
-            sess["captures"] += 1
+
+            # --- minimal UI per tick (lag fix): status + compact log only ---
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             suggestion_box(live_suggestion(len(results), float(gray.mean()),
                                            float(cv2.Laplacian(gray, cv2.CV_64F).var())))
-            st.image(vis, width="stretch")
-            new_marks = _apply_marks(results, cid, sess)
+            if liveness > 0 and not live_ok:
+                st.warning("🛡️ Still frame detected — move naturally; not "
+                           "marking from frozen images.")
+            new_marks = _apply_marks(results, cid, sess, live_ok)
             if new_marks:
                 st.toast(f"{', '.join(new_marks)} — marked", icon="🪪")
+            if sess["log"]:
+                st.dataframe(pd.DataFrame(sess["log"][:6]), hide_index=True,
+                             width="stretch")
 
         _loop()
-        if sess["started"] and sess["vis"] is not None:
-            st.image(sess["vis"], width="stretch")
 
     with right:
         st.markdown("**Session log**")
@@ -625,10 +690,18 @@ def _live_session(cid: str, cls: dict, enc: dict, tolerance: float):
         c1.metric("Marked", len(sess["log"]))
         c2.metric("Unknown", sess["unknown"])
         c3.metric("Captures", sess["captures"])
-        if sess["log"]:
-            st.dataframe(pd.DataFrame(sess["log"]), hide_index=True, width="stretch")
-        elif sess["started"]:
-            st.caption("Recognized students appear here automatically.")
+        unmarked = [p for p in cls.get("students", [])
+                    if p in enc and not any(r["ID"] == p for r in sess["log"])]
+        if unmarked:
+            with st.container(border=True):
+                st.markdown("**🙋 Not recognized?** Mark manually (supervised):")
+                pick = st.selectbox("Student", unmarked,
+                                    format_func=lambda p:
+                                    f"{people[p].get('name', p)} ({p})",
+                                    key=f"manual::{cid}")
+                if st.button("✅ Mark present (manual)", width="stretch",
+                             key=f"manualb::{cid}"):
+                    confirm_manual(cid, pick, sess)
         if sess["unknown"] >= 3:
             st.warning("Repeated unknown faces — they may not be enrolled, or "
                        "not added to this class.")
@@ -638,12 +711,31 @@ def _live_session(cid: str, cls: dict, enc: dict, tolerance: float):
                 "log": list(sess["log"]), "unknown": sess["unknown"],
                 "captures": sess["captures"],
                 "ended": store.cfg.now().strftime("%H:%M:%S")}
-            sess.update(started=False, log=[], captures=0, unknown=0, vis=None)
+            sess.update(started=False, log=[], captures=0, unknown=0)
             st.rerun()
 
 
+@st.dialog("Mark this student present?")
+def confirm_manual(cid: str, pid: str, sess: dict):
+    nm = people.get(pid, {}).get("name", pid)
+    st.write(f"Teacher-confirmed mark for **{nm}** — recorded as "
+             f"**{store.status_now(classes[cid].get('late_after'))}** and "
+             "logged in the audit trail.")
+    c1, c2 = st.columns(2)
+    if c1.button("Cancel", width="stretch"):
+        st.rerun()
+    if c2.button("Confirm", type="primary", width="stretch"):
+        status = store.status_now(classes[cid].get("late_after"))
+        if store.mark(pid, nm, status, cid):
+            sess["log"].insert(0, {"Name": nm, "ID": pid,
+                                   "Status": STATUS_EMOJI.get(status, status),
+                                   "Score": "manual"})
+            store._audit(ACTOR, "mark_manual", f"{cid}/{pid}={status}")
+            st.toast(f"{nm} — marked (manual)", icon="🙋")
+        st.rerun()
+
+
 def _render_session_summary(summary_key: str, cid: str):
-    """Post-session results card."""
     s = st.session_state[summary_key]
     with st.container(border=True):
         st.markdown(f"**📋 Session ended** · {s['ended']}")
@@ -657,8 +749,8 @@ def _render_session_summary(summary_key: str, cid: str):
         if c1.button("🚫 Mark everyone else Absent", width="stretch",
                      key=f"absent::{summary_key}"):
             n = store.mark_absent_all(cid)
-            st.success(f"{n} student(s) marked Absent. Excused students kept "
-                       "their status.")
+            store._audit(ACTOR, "mark_absent_all", f"{cid} n={n}")
+            st.success(f"{n} student(s) marked Absent.")
         if c2.button("✅ Done — hide summary", width="stretch"):
             st.session_state.pop(summary_key, None)
             st.rerun()
@@ -673,6 +765,7 @@ def confirm_end_class(cid: str, sess_key: str = None):
         st.rerun()
     if c2.button("Mark absent", type="primary", width="stretch"):
         n = store.mark_absent_all(cid)
+        store._audit(ACTOR, "mark_absent_all", f"{cid} n={n}")
         if sess_key:
             st.session_state.pop(sess_key, None)
         flash("success", f"{n} student(s) marked Absent in {classes[cid]['name']}.")
@@ -680,29 +773,20 @@ def confirm_end_class(cid: str, sess_key: str = None):
 
 
 def _single_photo(cid: str, cls: dict, enc: dict, tolerance: float):
-    """One-shot flow — fallback, and the phone rear-camera mode."""
     left, right = st.columns([5, 4])
     with left:
-        st.caption(f"👥 {len(cls.get('students', []))} students in this class · "
-                   f"{len(enc)} ready for recognition"
-                   + (f" · late after **{cls['late_after']}**"
-                      if cls.get("late_after") else ""))
-        snap = st.camera_input("Scan the room")
+        snap = st.camera_input("Scan the room (assisted mode — no liveness)")
         results, rgb, inv = [], None, 1.0
         if snap is not None:
-            if not enc:
-                st.warning("No one in this class has face samples yet — see the "
-                           "readiness card above.")
-            else:
-                rgb = to_rgb(snap)
-                with st.spinner("Recognizing…"):
-                    vis, results, inv = _run_recognition(rgb, enc, tolerance)
-                st.image(vis, width="stretch")
+            rgb = to_rgb(snap)
+            with st.spinner("Recognizing…"):
+                vis, results, inv = _run_recognition(rgb, enc, tolerance)
+            st.image(vis, width="stretch")
         if st.button("🚫 End class — mark everyone else absent", width="stretch"):
             confirm_end_class(cid)
     with right:
         st.markdown("**Results**")
-        if snap is not None and not results and rgb is not None:
+        if snap is not None and not results:
             empty_state("😶", "No faces detected", "Move closer / improve lighting.")
         status = store.status_now(cls.get("late_after"))
         fresh = 0
@@ -716,13 +800,14 @@ def _single_photo(cid: str, cls: dict, enc: dict, tolerance: float):
                     nm = people.get(label, {}).get("name", label)
                     is_new = store.mark(label, nm, status, cid)
                     fresh += is_new
+                    if is_new:
+                        store._audit(ACTOR, "mark_photo", f"{cid}/{label}={status}")
                     c2.markdown(f"**{nm}**  \n`{label}` · score {dist:.2f}")
                     c2.markdown(f"<span class='pill pill-{status.lower()}'>{status}</span>"
                                 + (" <span class='pill pill-muted'>NEW</span>" if is_new else ""),
                                 unsafe_allow_html=True)
                 else:
-                    c2.markdown(f"**Unknown face**  \nscore {dist:.2f} — not on "
-                                "this class list")
+                    c2.markdown(f"**Unknown face**  \nscore {dist:.2f}")
         if fresh:
             st.toast(f"{fresh} new mark(s) in {cls['name']}", icon="🪪")
 
@@ -730,13 +815,22 @@ def _single_photo(cid: str, cls: dict, enc: dict, tolerance: float):
 # ================= ENROLL =================
 def page_enroll():
     section("➕", "Enroll student")
+    if not classes:
+        empty_data_hero(
+            "Before enrolling: create a class",
+            ["Classes group students for recognition — a student is only "
+             "recognized in classes they belong to.",
+             "Create one in 🏫 Classes (a single click), then come back."],
+            cta_label="🏫 Create a class", cta_page="Classes")
+        return
     c1, c2, c3 = st.columns(3)
     id_mode = c1.radio("ID mode", ["🤖 Automatic", "✍️ Custom"], horizontal=True)
     nxt = f"STU-{len(people) + 1:03d}"
     while nxt in people:
         nxt = f"STU-{int(nxt.split('-')[1]) + 1:03d}"
     if id_mode.startswith("🤖"):
-        pid = c2.text_input("Student ID (auto)", value=nxt, disabled=True)
+        pid = c2.text_input("Student ID (auto)", value=nxt, disabled=True,
+                            key="pid_auto")
     else:
         pid = c2.text_input("Student ID", key="pid")
     name = c3.text_input("Full name", key="pname")
@@ -744,13 +838,15 @@ def page_enroll():
         "Add to class(es) — students are only recognized in classes they belong to",
         list(classes), format_func=lambda c: f"{classes[c]['name']} ({c})",
         key="enroll_targets")
-    if pid in people:
-        st.warning(f"`{pid}` exists — new captures will be **added** to their "
-                   "existing samples.")
     if not pid.strip() or not name.strip():
         st.caption("Enter an ID and name to start capturing.")
         return
-    capture_section(pid.strip(), name.strip(), store, cfg, class_targets=targets)
+    if st.session_state.pop(f"saved::{pid.strip()}", False):
+        st.success(f"**{name.strip()}** saved. Form cleared for the next "
+                   "student.")
+    capture_section(pid.strip(), name.strip(), store, cfg, class_targets=targets,
+                    on_saved=lambda p: st.session_state.__setitem__(
+                        f"saved::{p}", True))
 
 
 # ================= STUDENTS =================
@@ -780,18 +876,14 @@ def parse_roster(df: pd.DataFrame) -> pd.DataFrame:
 def page_students():
     section("👥", "Students")
     tab_import, tab_photos, tab_edit = st.tabs(
-        ["📥 Import from file", "📷 Missing face samples", "✏️ Edit students"])
-
-    # NOTE: no early returns inside tabs — a `return` here would abort the
-    # whole page and blank every tab defined after it (v2.11.0 bug).
+        ["📥 Import from file", "📷 Missing face samples", "✏️ Manage students"])
 
     with tab_import:
         f = st.file_uploader("Upload CSV or Excel with columns **Name** "
                              "(and optional **ID**)",
                              type=["csv", "xlsx", "xls"])
         if f is None:
-            st.caption("Tip: you can edit IDs/names in the preview before "
-                       "importing.")
+            st.caption("Tip: edit IDs/names in the preview before importing.")
         else:
             try:
                 roster = parse_roster(pd.read_csv(f) if f.name.endswith("csv")
@@ -800,8 +892,6 @@ def page_students():
                 st.error(f"Could not read file: {e}")
                 roster = None
             if roster is not None:
-                st.caption("Edit IDs/names below before importing "
-                           "(add/remove rows freely).")
                 preview = st.data_editor(roster, num_rows="dynamic",
                                          hide_index=True, width="stretch",
                                          key="import_prev")
@@ -817,6 +907,8 @@ def page_students():
                             new += 1
                             for tgt in targets:
                                 store.add_to_class(tgt, str(r["ID"]).strip())
+                            store._audit(ACTOR, "import",
+                                         f"{tgt}/{r['ID']}")
                         else:
                             skip += 1
                     flash("success", f"Imported {new} new student(s)"
@@ -830,8 +922,6 @@ def page_students():
             empty_state("✅", "Everyone has face samples",
                         f"All students have at least {cfg.n_samples} samples.")
         else:
-            st.caption(f"**{len(pending)}** student(s) still need face samples — "
-                       "imported from a file or saved without photos.")
             pick = st.selectbox(
                 "Student", list(pending),
                 format_func=lambda p: f"{pending[p].get('name', p)} · {p}")
@@ -839,31 +929,6 @@ def page_students():
                 "Add this student to class(es) on save", list(classes),
                 format_func=lambda c: f"{classes[c]['name']} ({c})",
                 key=f"mstargets::{pick}")
-            ups = st.file_uploader(
-                "Upload photo files (JPG/PNG — one face per photo)",
-                type=["jpg", "jpeg", "png"], accept_multiple_files=True,
-                key=f"up::{pick}")
-            if ups and st.button(f"➕ Add {len(ups)} uploaded photo(s) as samples"):
-                added = 0
-                for upf in ups:
-                    arr = np.frombuffer(upf.getvalue(), np.uint8)
-                    bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                    if bgr is None:
-                        continue
-                    locs, encs = detect_and_encode(
-                        cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB),
-                        scale=1.0, num_jitters=3)
-                    if locs:
-                        store.enroll(pick, pending[pick].get("name", pick),
-                                     [encs[0]])
-                        added += 1
-                for _t in ms_targets:
-                    store.add_to_class(_t, pick)
-                flash("success" if added else "error",
-                      f"Added {added} sample(s) from photos." if added
-                      else "No usable faces found in the uploaded photos.")
-                st.rerun()
-            st.markdown("**…or capture with the camera**")
             capture_section(pick, pending[pick].get("name", pick), store, cfg,
                             class_targets=ms_targets)
 
@@ -872,14 +937,10 @@ def page_students():
         rows = []
         for p, info in people.items():
             n = counts.get(p, 0)
-            if n >= cfg.n_samples:
-                status = "✅ Ready"
-            elif n > 0:
-                status = "🟡 Partial — add more samples"
-            elif info.get("backend"):
-                status = "🔴 Needs recapture (model updated)"
-            else:
-                status = "⚪ No face samples"
+            status = ("✅ Ready" if n >= cfg.n_samples else
+                      "🟡 Partial" if n > 0 else
+                      "🔴 Needs recapture" if info.get("backend") else
+                      "⚪ No samples")
             rows.append({"ID": p, "Name": info.get("name", p),
                          "Samples": n, "Status": status})
         base = pd.DataFrame(rows)
@@ -887,15 +948,7 @@ def page_students():
             empty_state("👥", "No students yet",
                         "Enroll, import, or share a class invite link.")
         else:
-            st.caption(f"**{len(base)}** student(s) total · "
-                       f"{(base.Samples >= cfg.n_samples).sum()} ready for "
-                       "recognition")
-            show = st.selectbox("Show",
-                                ["All students", "Only those needing samples"],
-                                key="edit_filter")
-            view = (base if show == "All students"
-                    else base[base.Samples < cfg.n_samples])
-            ed = st.data_editor(view, disabled=["ID", "Samples", "Status"],
+            ed = st.data_editor(base, disabled=["ID", "Samples", "Status"],
                                 hide_index=True, width="stretch",
                                 num_rows="fixed", key="edit_people")
             if st.button("💾 Save name changes"):
@@ -904,23 +957,44 @@ def page_students():
                     orig = base.loc[base.ID == row["ID"], "Name"]
                     if not orig.empty and row["Name"] != orig.iloc[0]:
                         store.rename_person(row["ID"], row["Name"])
+                        store._audit(ACTOR, "rename", f"{row['ID']}")
                         n += 1
                 flash("success" if n else "info",
-                      f"Renamed {n} student(s)." if n
-                      else "No changes to apply.")
+                      f"Renamed {n} student(s)." if n else "No changes.")
                 st.rerun()
+            st.markdown("**🔄 Re-enroll** — capture fresh samples for an "
+                        "existing student.")
+            target = st.selectbox(
+                "Student", [""] + [f"{r['Name']} · {r['ID']}"
+                                   for _, r in base.iterrows()],
+                key="reenroll_pick")
+            if target and st.button("🔄 Open re-enroll", type="primary"):
+                nm, pidx = target.rsplit(" · ", 1)
+                reenroll_dialog(pidx, nm)
 
 
-# ================= CLASSES / TEACHERS / RECORDS =================
+@st.dialog(f"🔄 Re-enroll samples")
+def reenroll_dialog(pid: str):
+    name = people.get(pid, {}).get("name", pid)
+    st.caption(f"New samples for **{name}** (`{pid}`) — added on top of "
+               "existing ones.")
+    capture_section(pid, name, store, cfg,
+                    on_saved=lambda p: st.session_state.__setitem__(
+                        f"reenroll_done::{p}", True))
+    if st.session_state.pop(f"reenroll_done::{pid}", False):
+        st.success("Samples saved.")
+        st.rerun()
+
+
+# ================= CLASSES / TEACHERS / RECORDS / AUDIT =================
 @st.dialog("Delete class?")
 def confirm_delete_class(cid: str):
-    st.write(f"Delete **{classes[cid]['name']}**? Attendance history stays in "
-             "records.")
     c1, c2 = st.columns(2)
     if c1.button("Cancel", width="stretch"):
         st.rerun()
     if c2.button("Delete", type="primary", width="stretch"):
         store.delete_class(cid)
+        store._audit(ACTOR, "delete_class", cid)
         flash("success", f"Deleted class `{cid}`.")
         st.rerun()
 
@@ -944,7 +1018,7 @@ def class_card(cid: str, cls: dict, show_teacher: bool):
                 st.rerun()
             new_late = st.text_input("Late after (HH:MM)",
                                      value=cls.get("late_after") or "",
-                                     key=f"late{cid}")
+                                     key=f"latep{cid}")
             if st.button("Save settings", key=f"save{cid}", width="stretch"):
                 store.update_class(cid, {"late_after": new_late.strip()})
                 st.rerun()
@@ -952,22 +1026,18 @@ def class_card(cid: str, cls: dict, show_teacher: bool):
                 confirm_delete_class(cid)
         c1, c2, c3 = st.columns(3)
         c1.metric("Students", len(students))
-        c2.metric("Ready for recognition", sum(1 for p in students if p in enc_all))
+        c2.metric("Ready", sum(1 for p in students if p in enc_all))
         c3.metric("Late after", cls.get("late_after") or "—")
-        if show_teacher:
-            st.caption(f"Teacher: **{cls['teacher']}**")
 
         with st.expander("🔗 Invite link (students self-enroll)"):
             code = store.ensure_class_invite(cid)
             st.code(code or "—", language=None)
-            base = _app_base_url()
-            if base and code:
-                st.code(f"{base}/?invite={code}", language=None)
-            st.caption("Students open the link (or add `?invite=CODE` to your "
-                       "app URL) and enroll themselves into this class — no "
-                       "account needed. Regenerate to invalidate old links.")
+            base_url = _app_base_url()
+            if base_url and code:
+                st.code(f"{base_url}/?invite={code}", language=None)
             if st.button("♻️ Regenerate code", key=f"regen::{cid}"):
                 store.regenerate_invite(cid)
+                store._audit(ACTOR, "regen_invite", cid)
                 st.rerun()
 
         with st.expander("📈 Attendance rates"):
@@ -985,10 +1055,11 @@ def class_card(cid: str, cls: dict, show_teacher: bool):
             months = sorted({d[:7] for d in store.records_df(cid).Date.unique()},
                             reverse=True)
             if not months:
-                st.caption("No sessions recorded yet.")
+                st.caption("No sessions recorded yet — the heatmap appears "
+                           "after your first session.")
             else:
-                month = st.selectbox("Month", months, key=f"hm::{cid}")
-                _render_heatmap(cid, month)
+                _render_heatmap(cid, st.selectbox("Month", months,
+                                                  key=f"hm::{cid}"))
 
 
 def page_classes():
@@ -1003,16 +1074,22 @@ def page_classes():
             cid = ("".join(ch for ch in name.strip().lower()
                            if ch.isalnum() or ch in "-_")[:24]
                    or f"class-{len(classes)+1}")
-            ok = store.create_class(cid, name.strip(),
-                                    owner if user["role"] == "admin"
-                                    else user["username"],
-                                    late.strip() or None)
-            flash("success" if ok else "error",
-                  f"Created **{name.strip()}**." if ok
-                  else f"`{cid}` already exists.")
-            st.rerun()
+            if store.create_class(cid, name.strip(),
+                                  owner if user["role"] == "admin"
+                                  else user["username"],
+                                  late.strip() or None):
+                store._audit(ACTOR, "create_class", f"{cid} ({name.strip()})")
+                flash("success", f"Created **{name.strip()}**.")
+                st.rerun()
+            st.error(f"`{cid}` already exists.")
     if not classes:
-        empty_state("🏫", "No classes yet", "Create your first class above.")
+        empty_data_hero(
+            "Create your first class",
+            ["A class groups students and holds its own late rule and "
+             "invite link.",
+             "After creating it, share the invite link — students enroll "
+             "themselves."],
+            cta_label="➕ Use the form above", cta_page="")
         return
     for cid, cls in classes.items():
         class_card(cid, cls, show_teacher=(user["role"] == "admin"))
@@ -1029,24 +1106,25 @@ def page_teachers():
             npw = a2.text_input("Password (min 6 chars)", type="password")
             if st.form_submit_button("➕ Create account", type="primary"):
                 ok = auth.add_user(nu, npw, role="teacher")
+                store._audit(ACTOR, "create_teacher", nu.strip().lower() if ok else "failed")
                 flash("success" if ok else "error",
                       f"Created **{nu.strip().lower()}**." if ok else
                       "Invalid: empty/duplicate username, or password < 6 chars.")
                 st.rerun()
     with c2:
         with st.container(border=True):
-            st.markdown("**Manage an account**")
             target = st.selectbox("Account", [""] + sorted(users))
             if target:
                 newpw = st.text_input("New password", type="password", key="npw")
                 if st.button("Reset password", width="stretch") and newpw:
                     ok = auth.set_password(target, newpw)
+                    store._audit(ACTOR, "reset_password", target if ok else "failed")
                     flash("success" if ok else "error",
-                          "Password updated." if ok
-                          else "Password too short (min 6).")
+                          "Password updated." if ok else "Too short (min 6).")
                     st.rerun()
                 if st.button("🗑️ Remove account", width="stretch"):
                     ok = auth.remove_user(target)
+                    store._audit(ACTOR, "remove_teacher", f"{target} ok={ok}")
                     flash("success" if ok else "error",
                           "Removed." if ok else "Cannot remove the last admin.")
                     st.rerun()
@@ -1056,53 +1134,94 @@ def page_teachers():
                  hide_index=True, width="stretch")
 
 
+@st.dialog("Delete records?")
+def confirm_delete_records(n: int, rows_idx):
+    st.write(f"Permanently delete **{n}** record(s)? This can't be undone.")
+    c1, c2 = st.columns(2)
+    if c1.button("Cancel", width="stretch"):
+        st.rerun()
+    if c2.button("Delete", type="primary", width="stretch"):
+        store.delete_records(rows_idx)
+        store._audit(ACTOR, "delete_records", f"n={n}")
+        flash("success", f"Deleted {n} record(s).")
+        st.rerun()
+
+
 def page_records():
     section("📋", "Records")
-    df = scope_records()
-    if df.empty:
-        empty_state("📋", "No records yet", "Take attendance to create records.")
+    df_all = scope_records()
+    if df_all.empty:
+        empty_data_hero(
+            "No records yet",
+            ["Create a class and add students (invite links make this fast).",
+             "Run a live session in ✅ Take attendance.",
+             "Records land here automatically — filter, export, or delete."],
+            cta_label="✅ Take attendance", cta_page="Take attendance")
         return
     f1, f2, f3 = st.columns(3)
     cid = f1.selectbox("Class", ["All"] + list(classes),
                        format_func=lambda c: "All classes" if c == "All"
                        else f"{classes[c]['name']}")
-    date = f2.selectbox("Date", ["All"] + sorted(df.Date.unique(), reverse=True))
+    date = f2.selectbox("Date", ["All"] + sorted(df_all.Date.unique(), reverse=True))
     statuses = f3.multiselect("Status", ["Present", "Late", "Excused", "Absent"],
                               default=["Present", "Late", "Excused", "Absent"])
-    view = df[df.Class == cid] if cid != "All" else df
+    view = df_all[df_all.Class == cid] if cid != "All" else df_all
     if date != "All":
         view = view[view.Date == date]
-    view = view[view.Status.isin(statuses)]
+    view = view[view.Status.isin(statuses)].copy().reset_index().rename(
+        columns={"index": "_row"})
     k = st.columns(5)
     k[0].metric("Records", len(view))
     k[1].metric("Present", (view.Status == "Present").sum())
     k[2].metric("Late", (view.Status == "Late").sum())
     k[3].metric("Excused", (view.Status == "Excused").sum())
     k[4].metric("Absent", (view.Status == "Absent").sum())
-    v = view.copy()
+    v = view.drop(columns=["_row"]).copy()
     v["Status"] = v.Status.map(lambda s: STATUS_EMOJI.get(s, s))
-    st.dataframe(v, hide_index=True, width="stretch")
-    d1, d2 = st.columns(2)
-    d1.download_button("⬇️ Download CSV", view.to_csv(index=False).encode(),
+    v.insert(0, "🗑️", False)
+    ed = st.data_editor(v, hide_index=True, width="stretch", key="rec_editor",
+                        column_config={"🗑️": st.column_config.CheckboxColumn(
+                            "Delete", help="Tick, then Delete below")})
+    del_idx = view.loc[ed["🗑️"], "_row"].tolist() if "🗑️" in ed else []
+    b1, b2, b3 = st.columns(3)
+    if del_idx and b1.button(f"🗑️ Delete {len(del_idx)} record(s)",
+                             type="primary"):
+        confirm_delete_records(len(del_idx), del_idx)
+    b2.download_button("⬇️ CSV",
+                       view.drop(columns=["_row"]).to_csv(index=False).encode(),
                        "attendance.csv", "text/csv", width="stretch")
     buf = BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as xw:
-        view.to_excel(xw, index=False)
-    d2.download_button("⬇️ Download Excel", buf.getvalue(), "attendance.xlsx",
+        view.drop(columns=["_row"]).to_excel(xw, index=False)
+    b3.download_button("⬇️ Excel", buf.getvalue(), "attendance.xlsx",
                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                        width="stretch")
-    if cid != "All":
-        st.markdown("**Attendance rate (all sessions in this class)**")
-        r = rate_table(cid).dropna(subset=["Rate"])
-        if not r.empty:
-            r2 = r.sort_values("Rate", ascending=False)
-            chart = (alt.Chart(r2).mark_bar(cornerRadius=4, color="#4F46E5")
-                     .encode(x=alt.X("Rate:Q", scale=alt.Scale(domain=[0, 100]),
-                                     title=None),
-                             y=alt.Y("Name:N", sort=r2["Name"].tolist(), title=None),
-                             tooltip=["Name", "Rate"])
-                     .properties(height=min(34 * len(r2) + 40, 420)))
-            st.altair_chart(chart, width="stretch")
+
+
+def page_audit():
+    section("🗒️", "Audit log")
+    st.caption("Append-only trail of every mark, edit, deletion, enrollment "
+               "and account change. Populated from now on.")
+    adf = store.audit_df()
+    if adf.empty:
+        empty_state("🗒️", "No audit entries yet",
+                    "Actions are logged automatically as they happen.")
+        return
+    c1, c2, c3 = st.columns(3)
+    actor = c1.selectbox("Actor", ["All"] + sorted(adf.Actor.unique()))
+    action = c2.selectbox("Action", ["All"] + sorted(adf.Action.unique()))
+    day = c3.selectbox("Day", ["All"] + sorted({str(t)[:10] for t in adf.Time},
+                                               reverse=True))
+    view = adf
+    if actor != "All":
+        view = view[view.Actor == actor]
+    if action != "All":
+        view = view[view.Action == action]
+    if day != "All":
+        view = view[view.Time.str.startswith(day)]
+    st.dataframe(view.iloc[::-1], hide_index=True, width="stretch")
+    st.download_button("⬇️ Download audit log", view.to_csv(index=False).encode(),
+                       "audit.csv", "text/csv", width="stretch")
 
 
 # ================= NAV =================
@@ -1117,7 +1236,8 @@ def build_nav(role: str):
     if role == "admin":
         pages += [st.Page(page_teachers, title="Teachers", icon="👩‍🏫"),
                   st.Page(page_classes, title="Classes", icon="🏫"),
-                  st.Page(page_students, title="Students", icon="👥")]
+                  st.Page(page_students, title="Students", icon="👥"),
+                  st.Page(page_audit, title="Audit log", icon="🗒️")]
     pages += [st.Page(page_records, title="Records", icon="📋")]
     return pages
 
@@ -1143,11 +1263,24 @@ with st.sidebar:
             store.set_setting("timezone", tz)
             cfg.timezone = tz
             st.toast(f"Time zone set to {tz}")
+        st.divider()
+        blob = store.backup_zip()
+        st.download_button("⬇️ Download full backup (.zip)", blob,
+                           f"attendance-backup-{store._today()}.zip",
+                           "application/zip", width="stretch")
+        up = st.file_uploader("⬆️ Restore from backup (admin overwrites all)",
+                              type=["zip"])
+        if up and user["role"] == "admin" and not guest and \
+                st.button("⚠️ Restore now (overwrites everything)"):
+            ok = store.restore_zip(up.getvalue(), actor=ACTOR)
+            flash("success" if ok else "error",
+                  "Backup restored." if ok else "Invalid backup file.")
+            st.rerun()
     if user["role"] == "admin" and not guest and auth.default_admin:
         st.error("⚠️ You're using the default admin password — change it under "
                  "Teachers.")
     if st.button("Log out", width="stretch"):
         st.session_state.clear()
         st.rerun()
-    st.caption("v2.11.1 · self-hosted · data stays local")
+    st.caption("v2.13 · self-hosted · data stays local")
 pg.run()
