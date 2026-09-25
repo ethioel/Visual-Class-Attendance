@@ -16,7 +16,7 @@ from .config import Config
 from .engine import BACKEND_ID
 
 COLS = ["Date", "Time", "Class", "ID", "Name", "Status"]
-ACTIVE_STATUSES = ("Present", "Late", "Excused")
+ACTIVE_STATUSES = ("Present", "Late", "Excused")   # any of these blocks auto-marks
 
 _INVITE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"   # no 0/O, 1/I
 
@@ -40,17 +40,45 @@ def _atomic_dump(path: str, mode: str, writer) -> None:
 
 class Store:
     """Thread-safe, crash-safe persistence for people, encodings, classes,
-    attendance records and runtime settings."""
+    attendance records, runtime settings and the audit trail."""
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
         cfg.ensure_dirs()
         self._lock = threading.RLock()
+        # Optional attribution for store-internal audits (enroll). The app may
+        # set store.actor = username; defaults to "system".
+        self.actor: str = "system"
         self._marked: Set[Tuple[str, str, str]] = set()   # (date, class, id)
         df = self._read_csv()
         if not df.empty:
             done = df[(df.Date == self._today()) & (df.Status.isin(ACTIVE_STATUSES))]
             self._marked = {(self._today(), c, p) for c, p in zip(done.Class, done.ID)}
+
+    # ======================= audit =======================
+    @property
+    def audit_file(self) -> str:
+        return os.path.join(self.cfg.db_dir, "audit.csv")
+
+    def _audit(self, actor: str, action: str, detail: str = "") -> None:
+        """Append-only audit trail. Never raises — auditing must not break ops."""
+        try:
+            ts = self.cfg.now().isoformat(timespec="seconds")
+            new = not os.path.exists(self.audit_file)
+            with open(self.audit_file, "a", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                if new:
+                    w.writerow(["Time", "Actor", "Action", "Detail"])
+                w.writerow([ts, actor, action, detail])
+        except Exception:
+            pass
+
+    def audit_df(self, limit: int = 5000) -> pd.DataFrame:
+        with self._lock:
+            if os.path.exists(self.audit_file):
+                df = pd.read_csv(self.audit_file, dtype=str).fillna("")
+                return df.tail(limit)
+            return pd.DataFrame(columns=["Time", "Actor", "Action", "Detail"])
 
     # ======================= people =======================
     def load_people(self) -> Dict[str, dict]:
@@ -67,7 +95,8 @@ class Store:
 
     def enroll(self, person_id: str, name: str, encodings: List[np.ndarray]) -> None:
         """Add face samples. Creates the person if new; appends + updates the
-        display name if they already exist. Stamps the backend ID."""
+        display name if they already exist. Stamps the backend ID and writes
+        one audit entry (call sites do not audit enrollment)."""
         if not encodings:
             return
         with self._lock:
@@ -85,6 +114,8 @@ class Store:
             people[person_id]["backend"] = BACKEND_ID
             self.save_people(people)
             self.save_encodings(enc)
+        self._audit(getattr(self, "actor", "system"), "enroll",
+                    f"{person_id} +{len(encodings)} samples")
 
     def remove_person(self, person_id: str) -> bool:
         """Remove a person, their encodings, and every roster membership."""
@@ -105,6 +136,7 @@ class Store:
                     changed = True
             if changed:
                 self._save_classes(classes)
+        self._audit(getattr(self, "actor", "system"), "remove_person", person_id)
         return True
 
     def ensure_person(self, person_id: str, name: str) -> bool:
@@ -313,7 +345,8 @@ class Store:
     def mark(self, person_id: str, name: str, status: Optional[str] = None,
              class_id: str = "GENERAL") -> bool:
         """Append one record. False if this person already has one today (in
-        this class) — including Excused, which auto-marks never overwrite."""
+        this class) — including Excused, which auto-marks never overwrite.
+        Auditing happens at the call site, where the actor is known."""
         today, status = self._today(), (status or self.status_now())
         now_t = self.cfg.now().strftime("%H:%M:%S")
         with self._lock:
@@ -340,8 +373,9 @@ class Store:
 
     def set_status(self, person_id: str, name: str, status: Optional[str],
                    class_id: str = "GENERAL", date: Optional[str] = None) -> bool:
-        """Upsert a record with an explicit status. status=None removes the row.
-        Excused upserts like Present/Late — only ever set manually."""
+        """Upsert a record with an explicit status. status=None removes the row
+        (unmarks, so a later scan can re-mark). Excused upserts like
+        Present/Late — only ever set manually. Audited at the call site."""
         date = date or self._today()
         now_t = self.cfg.now().strftime("%H:%M:%S")
         with self._lock:
@@ -356,7 +390,7 @@ class Store:
                         "ID": person_id, "Name": name, "Status": status}])],
                         ignore_index=True)
                 self._marked.add((date, class_id, person_id))
-            else:
+            else:                                      # unmark / remove
                 df = df[~mask]
                 self._marked.discard((date, class_id, person_id))
             _atomic_dump(self.cfg.attendance_csv, "w",
@@ -365,7 +399,28 @@ class Store:
         self._backup()
         return True
 
+    def delete_records(self, row_indices: List[int]) -> int:
+        """Delete attendance rows by positional index into the full CSV frame
+        (RangeIndex → positions and labels coincide). Audited at call site."""
+        with self._lock:
+            df = self._read_csv()
+            if df.empty:
+                return 0
+            drop = {i for i in row_indices if 0 <= i < len(df)}
+            if not drop:
+                return 0
+            out = df.drop(index=list(drop))
+            _atomic_dump(self.cfg.attendance_csv, "w",
+                         lambda f: out.to_csv(f, index=False))
+            for i in drop:
+                r = df.iloc[i]
+                self._marked.discard((r["Date"], r["Class"], r["ID"]))
+        self._sync_excel()
+        return len(drop)
+
     def _present_today(self, class_id: str) -> Set[str]:
+        """IDs with any daytime status — 'mark absent' must never touch
+        students who are Present, Late, or Excused."""
         df = self.records_df(class_id)
         if df.empty:
             return set()
@@ -394,7 +449,9 @@ class Store:
         return count
 
     def attendance_rates(self, class_id: str) -> pd.DataFrame:
-        """Rate = attended / (sessions - excused sessions)."""
+        """Rate = attended / (sessions - excused sessions). Excused sessions
+        are removed from the denominator instead of counting against the
+        student."""
         df = self.records_df(class_id)
         people = self.load_people()
         roster = self.load_classes().get(class_id, {}).get("students", [])
@@ -432,6 +489,58 @@ class Store:
                 for pid in roster for d in dates]
         return pd.DataFrame(rows)
 
+    # ======================= backup / restore =======================
+    def backup_zip(self) -> bytes:
+        """Full db snapshot (people, encodings, classes, records, settings,
+        audit)."""
+        import io
+        import zipfile
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            for p in (self.cfg.people_file, self.cfg.enc_cache,
+                      self.classes_file, self.cfg.attendance_csv,
+                      self.settings_file, self.audit_file):
+                if os.path.exists(p):
+                    z.write(p, arcname=os.path.basename(p))
+        return buf.getvalue()
+
+    def restore_zip(self, data: bytes, actor: str = "system") -> bool:
+        """Replace current db contents from a backup zip. Destructive — the
+        caller must confirm. Restores to temp files then atomic-swaps."""
+        import io
+        import zipfile
+        try:
+            zf = zipfile.ZipFile(io.BytesIO(data))
+            names = set(zf.namelist())
+            if not {"people.json", "attendance_log.csv"}.issubset(names):
+                return False
+            targets = {
+                "people.json": self.cfg.people_file,
+                "encodings.pkl": self.cfg.enc_cache,
+                "classes.json": self.classes_file,
+                "attendance_log.csv": self.cfg.attendance_csv,
+                "settings.json": self.settings_file,
+                "audit.csv": self.audit_file,
+            }
+            for fname, dest in targets.items():
+                if fname in names:
+                    tmp = dest + ".restore"
+                    with open(tmp, "wb") as f:
+                        f.write(zf.read(fname))
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(tmp, dest)
+            self._marked.clear()
+            df = self._read_csv()
+            if not df.empty:
+                done = df[(df.Date == self._today()) & (df.Status.isin(ACTIVE_STATUSES))]
+                self._marked = {(self._today(), c, p)
+                                for c, p in zip(done.Class, done.ID)}
+            self._audit(actor, "restore", f"{len(names)} files")
+            return True
+        except Exception:
+            return False
+
     # ======================= exports / backup =======================
     def _sync_excel(self) -> None:
         try:
@@ -450,7 +559,9 @@ class Store:
         try:
             from huggingface_hub import HfApi
             HfApi(token=token).upload_file(
-                path_or_fileobj=self.cfg.attendance_csv, path_in_repo="attendance_log.csv",
-                repo_id=repo, repo_type="dataset", commit_message="attendance backup")
+                path_or_fileobj=self.cfg.attendance_csv,
+                path_in_repo="attendance_log.csv",
+                repo_id=repo, repo_type="dataset",
+                commit_message="attendance backup")
         except Exception:
             pass
