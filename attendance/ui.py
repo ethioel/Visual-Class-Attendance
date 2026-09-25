@@ -1,4 +1,5 @@
-"""Presentation helpers: theme-aware CSS, pills, sections, thumbnails."""
+"""Presentation helpers: theme-aware CSS, pills, sections, empty states,
+thumbnails."""
 from __future__ import annotations
 
 import cv2
@@ -96,29 +97,53 @@ STATUS_EMOJI = {"Present": "✅ Present", "Late": "⏰ Late", "Absent": "🚫 Ab
 def user_chip(user: dict) -> None:
     initials = "".join(w[0] for w in user["username"].replace("-", " ").split()[:2]).upper() or "U"
     st.markdown(f'<div class="userchip"><div class="avatar">{initials}</div><div>'
-                f'<div class="uname">{user["username"]}</div>{pill(user["role"], user["role"])}</div></div>',
+                f'<div class="uname">{user["username"]}</div>'
+                f'{pill(user["role"], user["role"])}</div></div>',
                 unsafe_allow_html=True)
 
 
 def empty_state(icon: str, title: str, hint: str = "") -> None:
+    """Compact in-place empty state for panels and tabs."""
     st.markdown(f'<div style="text-align:center;padding:2.2rem 1rem;">'
                 f'<div style="font-size:2.2rem;">{icon}</div>'
                 f'<div style="font-weight:700;margin:.4rem 0;">{title}</div>'
                 f'<div class="muted">{hint}</div></div>', unsafe_allow_html=True)
 
 
+def empty_data_hero(title: str, lines: list, cta_label: str = "",
+                    cta_page: str = "") -> None:
+    """First-run zero-data hero: up to three numbered setup steps. The CTA is
+    an anchor (styling only); navigation happens via st.page_link next to it
+    when the caller wants a button that actually switches pages."""
+    items = "".join(f"<li style='margin:.3rem 0'>{l}</li>" for l in lines)
+    cta = (f'<span style="display:inline-block;margin-top:1rem;'
+           f'background:linear-gradient(135deg,#4F46E5,#6366F1);color:#fff;'
+           f'padding:.5rem 1.1rem;border-radius:10px;font-weight:700;">'
+           f'{cta_label}</span>' if cta_label else "")
+    st.markdown(
+        f'<div style="text-align:center;padding:2.6rem 1rem;">'
+        f'<div style="font-size:2.6rem">🚀</div>'
+        f'<div style="font-size:1.25rem;font-weight:800;margin:.5rem 0;">{title}</div>'
+        f'<div class="muted" style="max-width:540px;margin:0 auto;text-align:left;">'
+        f"<ol style='padding-left:1.3rem'>{items}</ol></div>"
+        f"{cta}</div>", unsafe_allow_html=True)
+
+
 def hero() -> None:
     st.markdown('<div class="hero"><h1>🪪 Visual Attendance</h1>'
-                "<p>Face-first classroom operations — enroll once, scan the room, done.</p>"
-                '<div class="chips"><span>Multi-sample enrollment</span><span>Roster-scoped matching</span>'
-                "<span>Hands-free live scan</span><span>Dark mode</span></div></div>",
+                "<p>Face-first classroom operations — enroll once, scan the "
+                "room, done.</p>"
+                '<div class="chips"><span>Multi-sample enrollment</span>'
+                '<span>Roster-scoped matching</span>'
+                "<span>🛡️ Liveness check</span><span>Dark mode</span></div></div>",
                 unsafe_allow_html=True)
 
 
 def render_flash() -> None:
     f = st.session_state.pop("flash", None)
     if f:
-        {"success": st.success, "error": st.error, "info": st.info, "warning": st.warning}[f[0]](f[1])
+        {"success": st.success, "error": st.error,
+         "info": st.info, "warning": st.warning}[f[0]](f[1])
 
 
 def flash(kind: str, msg: str) -> None:
