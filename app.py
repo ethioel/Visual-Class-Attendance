@@ -309,8 +309,9 @@ def capture_section(pid: str, name: str, store: Store, cfg: Config,
                     st.session_state[f"lc::{pid}"] = now
                     st.session_state[f"fs::{pid}"] = now      # reset window
                     n += 1
-                    tag = "📸" if gated_ok else "📸 (forced — check lighting)"
-                    st.toast(f"Sample {n}/{cfg.n_samples} captured", icon=tag)
+                    st.toast(f"Sample {n}/{cfg.n_samples} captured"
+                             + ("" if gated_ok
+                                else " — forced, check lighting"), icon="📸")
             elif n >= cfg.n_samples:
                 st.session_state[done_key] = True
                 st.rerun()                       # one full rerun → Save visible
@@ -1546,5 +1547,5 @@ with st.sidebar:
     if st.button("Log out", width="stretch"):
         st.session_state.clear()
         st.rerun()
-    st.caption("v2.15.1 · self-hosted · data stays local")
+    st.caption("v2.15.2 · self-hosted · data stays local")
 pg.run()
