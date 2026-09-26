@@ -48,6 +48,7 @@ from attendance.auth import Auth
 from attendance.config import Config
 from attendance.engine import (annotate, best_match, detect_and_encode,
                                largest_face, recognize)
+from attendance.ops import OpsStore
 from attendance.store import Store
 from attendance.ui import (STATUS_EMOJI, empty_data_hero, empty_state,
                            face_thumb, flash, hero, render_flash, section,
@@ -72,6 +73,11 @@ def resources(db_dir: str):
     if tz:
         cfg.timezone = tz
     return cfg, store, auth
+
+
+@st.cache_resource
+def ops_resource(db_dir: str):
+    return OpsStore(Config(db_dir=db_dir))
 
 
 def to_rgb(upload) -> np.ndarray:
@@ -130,7 +136,7 @@ def _app_base_url() -> str:
     return ""
 
 
-# ---------------- theming (self-contained; immune to ui.py version) --------
+# ---------------- theming (self-contained) ----------------
 def _theme_is_dark() -> bool:
     try:
         return str(getattr(st.context.theme, "type", "light")).lower() == "dark"
@@ -139,10 +145,6 @@ def _theme_is_dark() -> bool:
 
 
 def _inject_css(hide_sidebar: bool = False, dark=None) -> None:
-    """Self-contained CSS injection. Raw constants live in attendance.ui and
-    have been stable since v2.3; if even those are missing, the app still
-    runs unstyled rather than crashing. dark=None → follow Streamlit theme;
-    True/False → force our layer."""
     d = _theme_is_dark() if dark is None else dark
     try:
         from attendance.ui import _CSS, _DARK, _HIDE_SIDEBAR
@@ -153,8 +155,6 @@ def _inject_css(hide_sidebar: bool = False, dark=None) -> None:
 
 
 def _dark_toggle(right: bool = True) -> bool:
-    """Render the 🌓 toggle; returns the effective dark state. Must be called
-    BEFORE _inject_css() so the choice applies in the same run."""
     c1, c2 = st.columns([9, 1]) if right else st.columns([1, 2])
     with c2:
         dark = st.toggle("🌓", value=st.session_state.get(
@@ -196,7 +196,7 @@ def _render_heatmap(cid: str, month: str):
 
 def capture_section(pid: str, name: str, store: Store, cfg: Config,
                     class_targets=None, on_saved=None):
-    """Capture widget with per-sample ✕ delete (retake-friendly)."""
+    """Capture widget with live annotated preview and per-sample ✕ delete."""
     class_targets = class_targets or []
     cap = st.session_state.setdefault(f"cap::{pid}", {"samples": [], "thumbs": []})
     run_key = f"auto::{pid}"
@@ -219,16 +219,23 @@ def capture_section(pid: str, name: str, store: Store, cfg: Config,
                     st.rerun()
 
     if mode.startswith("🎥"):
+        col_btn, col_state = st.columns([2, 3])
         if st.session_state.get(run_key):
-            if st.button("⏹️ Stop camera", width="stretch"):
+            if col_btn.button("⏹️ Stop camera", width="stretch"):
                 st.session_state[run_key] = False
                 st.session_state[done_key] = False
+                st.toast("Stopping camera…", icon="⏹️")
                 st.rerun()
         else:
-            if st.button("▶️ Start auto-capture", type="primary", width="stretch"):
+            if col_btn.button("▶️ Start auto-capture", type="primary",
+                              width="stretch"):
                 st.session_state[run_key] = True
                 st.session_state[done_key] = False
                 st.rerun()
+        if st.session_state.get(run_key):
+            col_state.caption("🔴 **LIVE** — auto-capturing…")
+
+        camera_input_live(key=f"camw::{pid}")   # persistent live preview
 
         @st.fragment(run_every=3.0)
         def _auto():
@@ -244,21 +251,19 @@ def capture_section(pid: str, name: str, store: Store, cfg: Config,
                 st.error(f"Camera error: {str(e)[:160]}")
                 return
             if frame is None:
-                st.info("Starting camera… allow the permission pop-up (once).")
                 return
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             bright, sharp = float(gray.mean()), float(cv2.Laplacian(gray, cv2.CV_64F).var())
             try:
-                locs, encs = detect_and_encode(rgb, scale=1.0,
-                                               num_jitters=cfg.enroll_jitters)
+                locs, encs = detect_and_encode(rgb, scale=1.0, num_jitters=1)
             except Exception as e:
                 st.error(f"Recognition error: {str(e)[:160]}")
                 return
             n = len(cap["samples"])
             if n < cfg.n_samples:
                 good = (len(locs) == 1 and 55 <= bright <= 210 and sharp >= 30)
-                if good and time.time() - st.session_state.get(f"lc::{pid}", 0) > 2.5:
+                if good and time.time() - st.session_state.get(f"lc::{pid}", 0) > 2.0:
                     cap["samples"].append(encs[0])
                     cap["thumbs"].append(face_thumb(rgb, locs[0], 72))
                     st.session_state[f"lc::{pid}"] = time.time()
@@ -269,6 +274,13 @@ def capture_section(pid: str, name: str, store: Store, cfg: Config,
                 st.session_state[run_key] = False
                 st.session_state[done_key] = True
                 st.rerun()
+
+            vis = cv2.cvtColor(annotate(
+                cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB),
+                [(l, "sample", True, 0.0) for l in locs]), cv2.COLOR_BGR2RGB)
+            st.image(cv2.resize(vis, (VIS_W, int(VIS_W * vis.shape[0]
+                                                   / max(1, vis.shape[1])))),
+                     width="stretch")
             st.progress(min(n / cfg.n_samples, 1.0),
                         text=f"{n}/{cfg.n_samples} samples captured")
 
@@ -281,8 +293,7 @@ def capture_section(pid: str, name: str, store: Store, cfg: Config,
                                    key=f"man::{pid}::{len(cap['samples'])}")
             if shot is not None:
                 rgb = to_rgb(shot)
-                locs, encs = detect_and_encode(rgb, scale=1.0,
-                                               num_jitters=cfg.enroll_jitters)
+                locs, encs = detect_and_encode(rgb, scale=1.0, num_jitters=1)
                 box = largest_face(locs)
                 if box is None:
                     st.error("No face detected — improve lighting and retake.")
@@ -312,7 +323,7 @@ def capture_section(pid: str, name: str, store: Store, cfg: Config,
             st.rerun()
 
 
-# ================= INVITE SELF-ENROLL (pre-login) =================
+# ================= INVITE CLASS PORTAL (pre-login) =================
 _invite = st.query_params.get("invite")
 if _invite and "user" not in st.session_state:
     dark = _dark_toggle(right=False)
@@ -333,6 +344,7 @@ if _invite and "user" not in st.session_state:
             st.caption("You can close this page.")
             st.stop()
         st.title(f"🪪 Join {icls['name']}")
+        room_note = ops_room_note = ""
         st.caption("Enter your details and capture your face samples — after "
                    "saving, you're automatically on the class list.")
         c1, c2 = st.columns(2)
@@ -382,6 +394,7 @@ guest = user["role"] == "guest"
 dark = _dark_toggle()
 _inject_css(dark=dark)
 cfg, store, auth = resources(GUEST_DB if guest else MAIN_DB)
+ops = ops_resource(GUEST_DB if guest else MAIN_DB)
 render_flash()
 store.actor = user["username"]
 
@@ -436,6 +449,18 @@ def page_dashboard():
         st.caption("⟳ auto-refreshes every 60s")
 
     live_panel()
+
+    # Now / Next / Room from the timetable
+    if classes:
+        cid0 = st.selectbox("Class schedule", list(classes),
+                            format_func=lambda c: classes[c]["name"],
+                            label_visibility="collapsed", key="dash_sched")
+        now_s, next_s = ops.now_and_next(cid0)
+        n1, n2, n3 = st.columns(3)
+        n1.metric("Room", ops.room_of(cid0))
+        n2.metric("Now", f"{now_s['start']}–{now_s['end']}" if now_s else "—")
+        n3.metric("Next", f"{next_s['day']} {next_s['start']}" if next_s else "—")
+
     d = scope_records()
     dates = sorted(d.Date.unique())[-14:] if not d.empty else []
     cl, ch = st.columns([2, 3])
@@ -547,10 +572,10 @@ def page_attendance():
         store.update_class(cid, {"late_after": late_str})
         cls["late_after"] = late_str
         store._audit(ACTOR, "set_late", f"{cid}={late_str}")
-        flash("success", f"Late time set to **{late_str}** — scans below use "
-              "it instantly.")
+        flash("success", f"Late time set to **{late_str}**.")
         st.rerun()
-    cL3.caption(f"Current: **{cur or 'off (all marks = Present)'}**")
+    cL3.caption(f"Current: **{cur or 'off (all marks = Present)'}** · Room: "
+                f"**{ops.room_of(cid)}**")
 
     enc = {p: enc_all[p] for p in cls.get("students", []) if p in enc_all}
     _class_readiness_card(cid, cls)
@@ -652,7 +677,8 @@ def _live_session(cid: str, cls: dict, enc: dict, tolerance: float,
             with st.container(border=True):
                 st.markdown("**🎥 Live auto-scan**")
                 st.caption(f"{len(enc)} students ready · marks as **{status}**"
-                           + (" · 🛡️ liveness ON" if liveness > 0 else ""))
+                           + (" · 🛡️ liveness ON" if liveness > 0 else "")
+                           + f" · Room: **{ops.room_of(cid)}**")
                 sess["interval"] = st.select_slider(
                     "Capture interval", options=[3, 5, 8],
                     value=sess.get("interval", 5),
@@ -752,6 +778,7 @@ def _live_session(cid: str, cls: dict, enc: dict, tolerance: float,
                        "not added to this class.")
         if sess["started"] and st.button("⏹️ End session", type="primary",
                                          width="stretch"):
+            st.toast("Ending session…", icon="⏹️")
             st.session_state[summary_key] = {
                 "log": list(sess["log"]), "unknown": sess["unknown"],
                 "captures": sess["captures"],
@@ -1028,6 +1055,126 @@ def reenroll_dialog(pid: str):
         st.rerun()
 
 
+# ================= OPS: OVERSIGHT / TIMETABLES / POLICY =================
+def page_oversight():
+    section("🏛️", "School oversight")
+    if not classes:
+        empty_data_hero(
+            "Nothing to oversee yet",
+            ["Classes appear here once created — with sessions, rates, "
+             "rooms and automatic flags."])
+        return
+    odf = ops.oversight(store, classes, people)
+    flagged = odf[~odf.Flags.str.startswith("✅")] if not odf.empty else odf
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Classes", len(odf))
+    c2.metric("Flagged", len(flagged))
+    c3.metric("Sessions total", int(odf.Sessions.sum()) if not odf.empty else 0)
+    if not flagged.empty:
+        st.warning(f"**{len(flagged)} class(es) need attention** — see Flags.")
+    st.dataframe(odf, hide_index=True, width="stretch")
+
+    st.divider()
+    st.markdown("**⚙️ Attendance policy**")
+    pol = ops.policy()
+    p1, p2, p3 = st.columns(3)
+    min_rate = p1.number_input("Minimum attendance %", 0, 100,
+                               int(pol["min_rate"]), key="pol_min")
+    stale = p2.number_input("Flag class if no session for (days)", 1, 60,
+                            pol["stale_days"], key="pol_stale")
+    manual = p3.number_input("Flag student after N manual marks", 1, 50,
+                             pol["manual_flag"], key="pol_manual")
+    if st.button("💾 Save policy"):
+        ops.set_policy(ACTOR, min_rate=min_rate, stale_days=stale,
+                       manual_flag=manual)
+        flash("success", "Policy saved.")
+        st.rerun()
+
+    st.divider()
+    st.markdown("**⚠️ Defaulter report** (below the policy minimum)")
+    cid_d = st.selectbox("Class", list(classes),
+                         format_func=lambda c: f"{classes[c]['name']} · {c}",
+                         key="def_class")
+    d = ops.defaulters(store, cid_d, people)
+    if d.empty:
+        st.success("No defaulters in this class.")
+    else:
+        st.dataframe(d, hide_index=True, width="stretch")
+
+    st.divider()
+    st.markdown("**🔎 Anomalies — students frequently marked manually** "
+                "(recognition failing for them, or proxy attempts)")
+    an = ops.anomalies(store, store.audit_df())
+    if an.empty:
+        st.caption("No anomaly pattern detected.")
+    else:
+        st.dataframe(an, hide_index=True, width="stretch")
+
+    st.divider()
+    st.markdown("**📄 Institutional report (exportable)**")
+    df_all = store.records_df()
+    if df_all.empty:
+        st.caption("No records yet.")
+    else:
+        months = sorted({d[:7] for d in df_all.Date.unique()}, reverse=True)
+        month = st.selectbox("Month", months, key="ops_month")
+        rep = ops.institutional_report(store, classes, people, month)
+        if rep.empty:
+            st.caption("No sessions in that month.")
+        else:
+            st.dataframe(rep, hide_index=True, width="stretch")
+            st.download_button("⬇️ Download report (CSV)",
+                               rep.to_csv(index=False).encode(),
+                               f"institutional-report-{month}.csv",
+                               "text/csv", width="stretch")
+
+
+def page_timetables():
+    section("🗓️", "Timetables & rooms")
+    if not classes:
+        empty_data_hero("No classes yet", ["Create classes first (🏫 Classes).",
+                                           "Then set each class's room and "
+                                           "weekly schedule here."])
+        return
+    cid = st.selectbox("Class", list(classes),
+                       format_func=lambda c: f"{classes[c]['name']} · {c}",
+                       key="tt_class")
+    room = st.text_input("Room / location", value=ops.room_of(cid),
+                         placeholder="e.g. Room 204, Block B")
+    if st.button("💾 Save room"):
+        ops.set_room(cid, room)
+        store._audit(ACTOR, "set_room", f"{cid}={room}")
+        st.rerun()
+
+    st.markdown("**Weekly schedule**")
+    slots = ops.slots_of(cid)
+    with st.form("slot", border=False):
+        c1, c2, c3 = st.columns(3)
+        day = c1.selectbox("Day", ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat",
+                                   "Sun"])
+        s1, s2 = c2.columns(2)
+        start = s1.time_input("Start", value=_dt.time(9, 0), key="slot_s")
+        end = s2.time_input("End", value=_dt.time(10, 30), key="slot_e")
+        if st.form_submit_button("➕ Add slot") and end > start:
+            slots = slots + [{"day": day,
+                              "start": start.strftime("%H:%M"),
+                              "end": end.strftime("%H:%M")}]
+            ops.set_slots(ACTOR, cid, slots)
+            st.rerun()
+    if not slots:
+        st.caption("No slots yet — add the weekly meeting times above. "
+                   "The dashboard shows 'Now / Next' from these.")
+    else:
+        st.dataframe(pd.DataFrame(slots), hide_index=True, width="stretch")
+        del_i = st.selectbox("Remove slot #", [""] +
+                             [str(i + 1) for i in range(len(slots))],
+                             key="slot_del")
+        if del_i and st.button("🗑️ Remove slot"):
+            slots.pop(int(del_i) - 1)
+            ops.set_slots(ACTOR, cid, slots)
+            st.rerun()
+
+
 # ================= CLASSES / TEACHERS / RECORDS / AUDIT =================
 @st.dialog("Delete class?")
 def confirm_delete_class(cid: str):
@@ -1066,10 +1213,13 @@ def class_card(cid: str, cls: dict, show_teacher: bool):
                 st.rerun()
             if st.button("🗑️ Delete class", key=f"del{cid}", width="stretch"):
                 confirm_delete_class(cid)
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns(4)
         c1.metric("Students", len(students))
         c2.metric("Ready", sum(1 for p in students if p in enc_all))
         c3.metric("Late after", cls.get("late_after") or "—")
+        c4.metric("Room", ops.room_of(cid))
+        if show_teacher:
+            st.caption(f"Teacher: **{cls['teacher']}**")
 
         with st.expander("🔗 Invite link (students self-enroll)"):
             code = store.ensure_class_invite(cid)
@@ -1274,11 +1424,14 @@ def build_nav(role: str):
                   st.Page(page_enroll, title="Enroll student", icon="➕"),
                   st.Page(page_students, title="Students", icon="👥")]
     if role == "teacher":
-        pages += [st.Page(page_classes, title="My classes", icon="🏫")]
+        pages += [st.Page(page_classes, title="My classes", icon="🏫"),
+                  st.Page(page_timetables, title="Timetables", icon="🗓️")]
     if role == "admin":
         pages += [st.Page(page_teachers, title="Teachers", icon="👩‍🏫"),
                   st.Page(page_classes, title="Classes", icon="🏫"),
                   st.Page(page_students, title="Students", icon="👥"),
+                  st.Page(page_oversight, title="Oversight", icon="🏛️"),
+                  st.Page(page_timetables, title="Timetables", icon="🗓️"),
                   st.Page(page_audit, title="Audit log", icon="🗒️")]
     pages += [st.Page(page_records, title="Records", icon="📋")]
     return pages
@@ -1324,5 +1477,5 @@ with st.sidebar:
     if st.button("Log out", width="stretch"):
         st.session_state.clear()
         st.rerun()
-    st.caption("v2.13.3 · self-hosted · data stays local")
+    st.caption("v2.14-ops · self-hosted · data stays local")
 pg.run()
