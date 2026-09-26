@@ -1,4 +1,5 @@
 import base64
+import datetime as _dt
 import logging
 import os
 import time
@@ -9,7 +10,6 @@ import cv2
 import numpy as np
 import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
 from PIL import Image
 
 try:
@@ -61,7 +61,7 @@ GUEST_DB = "demo_db"
 STATUS_OPTS = ["—", "Present", "Late", "Excused", "Absent"]
 WORK_WIDTH = 960
 LIVE_PROB = 0.85
-VIS_W = 640                      # downscaled annotated frame in live loop
+VIS_W = 640                      # live preview width (small = no lag)
 
 
 @st.cache_resource
@@ -175,7 +175,7 @@ def capture_section(pid: str, name: str, store: Store, cfg: Config,
         for i, tmb in enumerate(cap["thumbs"]):
             with cols[i % 5]:
                 st.image(tmb, width="stretch")
-                if st.button("✕ Remove", key=f"x::{pid}::{i}",
+                if st.button("✕", key=f"x::{pid}::{i}",
                              help="Delete this sample — retake to replace"):
                     cap["samples"].pop(i)
                     cap["thumbs"].pop(i)
@@ -351,6 +351,7 @@ classes = (store.load_classes() if user["role"] in ("admin", "guest")
            else store.classes_of(user["username"]))
 people = store.load_people()
 enc_all = store.load_encodings()
+store.actor = user["username"]          # store-internal audits (enroll etc.)
 
 ACTOR = user["username"]
 
@@ -367,22 +368,19 @@ def rate_table(cid: str) -> pd.DataFrame:
     return r
 
 
-# ================= DASHBOARD (with first-run hero) =================
+# ================= DASHBOARD (first-run hero) =================
 def page_dashboard():
     section("📊", "Dashboard")
     if guest:
         st.info("Demo sandbox — everything resets when the app sleeps.", icon="🧪")
 
-    # First-run: nothing configured at all
     if not people and not classes and scope_records().empty:
         empty_data_hero(
             "Welcome — let's set up your first class",
             ["Create a class (🏫 Classes → ➕ Create class).",
              "Share its invite link, or enroll students yourself (➕ Enroll).",
              "Start a live session in ✅ Take attendance — students walk in "
-             "and get marked automatically."],
-            cta_label="🏫 Create your first class",
-            cta_page="Classes")
+             "and get marked automatically."])
         return
 
     @st.fragment(run_every="60s")
@@ -488,17 +486,16 @@ def page_attendance():
             ["Create a class (🏫 Classes → ➕ Create class).",
              "Add students: share the invite link, enroll manually, or "
              "import a roster (👥 Students).",
-             "Come back here and start a live session."],
-            cta_label="🏫 Create your first class", cta_page="Classes")
+             "Come back here and start a live session."])
         return
     cid = st.selectbox("Class", list(classes),
                        format_func=lambda c: f"{classes[c]['name']} · {c}")
     cls = classes[cid]
 
+    # ---- inline late-time editor ----
     cL1, cL2, cL3 = st.columns([2, 2, 3])
     cur = cls.get("late_after") or ""
     hh, mm = (cur.split(":") + ["00"])[:2] if cur else ("09", "00")
-    import datetime as _dt
     try:
         late_val = cL2.time_input("Late after (marks from this time = Late)",
                                   value=_dt.time(int(hh), int(mm)),
@@ -526,6 +523,7 @@ def page_attendance():
         liveness = st.slider("Liveness strictness (0 = off)", 0.0, 1.0, 0.35, 0.05,
                              help="Requires visible motion between frames — "
                              "defeats holding up a still photo.")
+
     mode = st.radio("Scan mode", ["🎥 Live auto-scan (hands-free)", "📷 Single photo"],
                     horizontal=True, key="scan_mode")
 
@@ -574,8 +572,6 @@ def _run_recognition(frame_bgr, enc: dict, tolerance: float):
 
 
 def _apply_marks(results, cid: str, sess: dict, live_ok: bool):
-    """Mark known faces. If liveness is on and live_ok is False, no auto-marks
-    this tick (UI shows why). Manual check-in still available."""
     status = store.status_now(classes[cid].get("late_after"))
     new_marks, any_unknown = [], False
     for box, label, known, dist in results:
@@ -601,8 +597,8 @@ def _live_session(cid: str, cls: dict, enc: dict, tolerance: float,
     key = f"session::{cid}"
     sess = st.session_state.setdefault(key, {"started": False, "log": [],
                                              "captures": 0, "unknown": 0,
-                                             "last_emb": None,
-                                             "last_mark_t": 0.0})
+                                             "last_emb": None, "vis": None,
+                                             "vis_tick": -1})
     summary_key = f"summary::{cid}"
     status = store.status_now(cls.get("late_after"))
     if not enc:
@@ -625,7 +621,7 @@ def _live_session(cid: str, cls: dict, enc: dict, tolerance: float,
                 if st.button("▶️ Start live session", type="primary",
                              width="stretch"):
                     sess.update(started=True, log=[], captures=0, unknown=0,
-                                last_emb=None)
+                                last_emb=None, vis=None, vis_tick=-1)
                     st.session_state.pop(summary_key, None)
                     st.rerun()
 
@@ -643,8 +639,8 @@ def _live_session(cid: str, cls: dict, enc: dict, tolerance: float,
             if frame is None:
                 st.info("Starting camera… allow the permission pop-up (once).")
                 return
+            tick = sess["captures"]
             try:
-                # --- recognition ---
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 work, _ = to_working(rgb)
                 locs, encs = detect_and_encode(work, scale=1.0,
@@ -668,13 +664,25 @@ def _live_session(cid: str, cls: dict, enc: dict, tolerance: float,
                 st.error(f"Recognition error: {str(e)[:160]}")
                 return
 
-            # --- minimal UI per tick (lag fix): status + compact log only ---
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             suggestion_box(live_suggestion(len(results), float(gray.mean()),
                                            float(cv2.Laplacian(gray, cv2.CV_64F).var())))
             if liveness > 0 and not live_ok:
                 st.warning("🛡️ Still frame detected — move naturally; not "
                            "marking from frozen images.")
+
+            # --- preview: update only on meaningful change, small image ---
+            changed = bool([r for r in results if r[2]]) or \
+                      any(not r[2] for r in results)
+            if changed or sess["vis"] is None or tick % 3 == 0:
+                vis = cv2.cvtColor(
+                    annotate(cv2.cvtColor(work, cv2.COLOR_RGB2BGR), results),
+                    cv2.COLOR_BGR2RGB)
+                sess["vis"] = cv2.resize(vis, (VIS_W, int(VIS_W * vis.shape[0]
+                                                            / max(1, vis.shape[1]))))
+            if sess["vis"] is not None:
+                st.image(sess["vis"], width="stretch")
+
             new_marks = _apply_marks(results, cid, sess, live_ok)
             if new_marks:
                 st.toast(f"{', '.join(new_marks)} — marked", icon="🪪")
@@ -718,14 +726,13 @@ def _live_session(cid: str, cls: dict, enc: dict, tolerance: float,
 @st.dialog("Mark this student present?")
 def confirm_manual(cid: str, pid: str, sess: dict):
     nm = people.get(pid, {}).get("name", pid)
+    status = store.status_now(classes[cid].get("late_after"))
     st.write(f"Teacher-confirmed mark for **{nm}** — recorded as "
-             f"**{store.status_now(classes[cid].get('late_after'))}** and "
-             "logged in the audit trail.")
+             f"**{status}** and logged in the audit trail.")
     c1, c2 = st.columns(2)
     if c1.button("Cancel", width="stretch"):
         st.rerun()
     if c2.button("Confirm", type="primary", width="stretch"):
-        status = store.status_now(classes[cid].get("late_after"))
         if store.mark(pid, nm, status, cid):
             sess["log"].insert(0, {"Name": nm, "ID": pid,
                                    "Status": STATUS_EMOJI.get(status, status),
@@ -820,8 +827,7 @@ def page_enroll():
             "Before enrolling: create a class",
             ["Classes group students for recognition — a student is only "
              "recognized in classes they belong to.",
-             "Create one in 🏫 Classes (a single click), then come back."],
-            cta_label="🏫 Create a class", cta_page="Classes")
+             "Create one in 🏫 Classes (a single click), then come back."])
         return
     c1, c2, c3 = st.columns(3)
     id_mode = c1.radio("ID mode", ["🤖 Automatic", "✍️ Custom"], horizontal=True)
@@ -907,8 +913,7 @@ def page_students():
                             new += 1
                             for tgt in targets:
                                 store.add_to_class(tgt, str(r["ID"]).strip())
-                            store._audit(ACTOR, "import",
-                                         f"{tgt}/{r['ID']}")
+                            store._audit(ACTOR, "import", f"{tgt}/{r['ID']}")
                         else:
                             skip += 1
                     flash("success", f"Imported {new} new student(s)"
@@ -957,7 +962,7 @@ def page_students():
                     orig = base.loc[base.ID == row["ID"], "Name"]
                     if not orig.empty and row["Name"] != orig.iloc[0]:
                         store.rename_person(row["ID"], row["Name"])
-                        store._audit(ACTOR, "rename", f"{row['ID']}")
+                        store._audit(ACTOR, "rename", row["ID"])
                         n += 1
                 flash("success" if n else "info",
                       f"Renamed {n} student(s)." if n else "No changes.")
@@ -970,10 +975,10 @@ def page_students():
                 key="reenroll_pick")
             if target and st.button("🔄 Open re-enroll", type="primary"):
                 nm, pidx = target.rsplit(" · ", 1)
-                reenroll_dialog(pidx, nm)
+                reenroll_dialog(pidx)
 
 
-@st.dialog(f"🔄 Re-enroll samples")
+@st.dialog("🔄 Re-enroll samples")
 def reenroll_dialog(pid: str):
     name = people.get(pid, {}).get("name", pid)
     st.caption(f"New samples for **{name}** (`{pid}`) — added on top of "
@@ -1088,8 +1093,7 @@ def page_classes():
             ["A class groups students and holds its own late rule and "
              "invite link.",
              "After creating it, share the invite link — students enroll "
-             "themselves."],
-            cta_label="➕ Use the form above", cta_page="")
+             "themselves."])
         return
     for cid, cls in classes.items():
         class_card(cid, cls, show_teacher=(user["role"] == "admin"))
@@ -1106,7 +1110,8 @@ def page_teachers():
             npw = a2.text_input("Password (min 6 chars)", type="password")
             if st.form_submit_button("➕ Create account", type="primary"):
                 ok = auth.add_user(nu, npw, role="teacher")
-                store._audit(ACTOR, "create_teacher", nu.strip().lower() if ok else "failed")
+                store._audit(ACTOR, "create_teacher",
+                             nu.strip().lower() if ok else "failed")
                 flash("success" if ok else "error",
                       f"Created **{nu.strip().lower()}**." if ok else
                       "Invalid: empty/duplicate username, or password < 6 chars.")
@@ -1118,7 +1123,8 @@ def page_teachers():
                 newpw = st.text_input("New password", type="password", key="npw")
                 if st.button("Reset password", width="stretch") and newpw:
                     ok = auth.set_password(target, newpw)
-                    store._audit(ACTOR, "reset_password", target if ok else "failed")
+                    store._audit(ACTOR, "reset_password",
+                                 target if ok else "failed")
                     flash("success" if ok else "error",
                           "Password updated." if ok else "Too short (min 6).")
                     st.rerun()
@@ -1155,8 +1161,7 @@ def page_records():
             "No records yet",
             ["Create a class and add students (invite links make this fast).",
              "Run a live session in ✅ Take attendance.",
-             "Records land here automatically — filter, export, or delete."],
-            cta_label="✅ Take attendance", cta_page="Take attendance")
+             "Records land here automatically — filter, export, or delete."])
         return
     f1, f2, f3 = st.columns(3)
     cid = f1.selectbox("Class", ["All"] + list(classes),
@@ -1201,7 +1206,7 @@ def page_records():
 def page_audit():
     section("🗒️", "Audit log")
     st.caption("Append-only trail of every mark, edit, deletion, enrollment "
-               "and account change. Populated from now on.")
+               "and account change.")
     adf = store.audit_df()
     if adf.empty:
         empty_state("🗒️", "No audit entries yet",
@@ -1282,5 +1287,5 @@ with st.sidebar:
     if st.button("Log out", width="stretch"):
         st.session_state.clear()
         st.rerun()
-    st.caption("v2.13 · self-hosted · data stays local")
+    st.caption("v2.13.1 · self-hosted · data stays local")
 pg.run()
