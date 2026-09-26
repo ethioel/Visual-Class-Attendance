@@ -89,16 +89,20 @@ def to_rgb(upload) -> np.ndarray:
     return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
 
-def camera_frame_bgr():
-    raw = camera_input_live()
+def _raw_to_bgr(raw):
+    """Convert any camera_input_live return type to BGR ndarray (None if empty)."""
     if raw is None:
         return None
-    if isinstance(raw, str):
+    if isinstance(raw, str):                       # data URL
         raw = BytesIO(base64.b64decode(raw.split(",", 1)[1]))
     elif isinstance(raw, (bytes, bytearray)):
         raw = BytesIO(raw)
     img = raw if isinstance(raw, Image.Image) else Image.open(raw)
     return cv2.cvtColor(np.asarray(img.convert("RGB")), cv2.COLOR_RGB2BGR)
+
+
+def camera_frame_bgr():
+    return _raw_to_bgr(camera_input_live())
 
 
 def to_working(rgb, max_w: int = WORK_WIDTH):
@@ -136,7 +140,7 @@ def _app_base_url() -> str:
     return ""
 
 
-# ---------------- theming (self-contained) ----------------
+# ---------------- theming (self-contained; immune to ui.py version) --------
 def _theme_is_dark() -> bool:
     try:
         return str(getattr(st.context.theme, "type", "light")).lower() == "dark"
@@ -145,6 +149,9 @@ def _theme_is_dark() -> bool:
 
 
 def _inject_css(hide_sidebar: bool = False, dark=None) -> None:
+    """Self-contained CSS injection. Raw constants live in attendance.ui and
+    are stable across versions; if even those are missing the app still runs
+    (unstyled) instead of crashing. dark=None → follow Streamlit theme."""
     d = _theme_is_dark() if dark is None else dark
     try:
         from attendance.ui import _CSS, _DARK, _HIDE_SIDEBAR
@@ -196,96 +203,106 @@ def _render_heatmap(cid: str, month: str):
 
 def capture_section(pid: str, name: str, store: Store, cfg: Config,
                     class_targets=None, on_saved=None):
-    """Capture widget with live annotated preview and per-sample ✕ delete."""
+    """Hands-free enrollment: one in-fragment camera widget at attendance-like
+    width ([3,2] columns), auto-captures cfg.n_samples quality-gated samples,
+    ✕-deletable thumbnails, small annotated preview. No custom camera buttons —
+    the widget owns the camera lifecycle; capture auto-stops at 5/5."""
     class_targets = class_targets or []
     cap = st.session_state.setdefault(f"cap::{pid}", {"samples": [], "thumbs": []})
-    run_key = f"auto::{pid}"
     done_key = f"autodone::{pid}"
     mode = st.radio("Capture mode",
                     ["🎥 Auto-capture (hands-free)", "📷 Manual snapshots"],
                     horizontal=True, key=f"cmode::{pid}")
 
-    def _thumb_row():
-        if not cap["thumbs"]:
-            return
-        cols = st.columns(5)
-        for i, tmb in enumerate(cap["thumbs"]):
-            with cols[i % 5]:
-                st.image(tmb, width="stretch")
-                if st.button("✕", key=f"x::{pid}::{i}",
-                             help="Delete this sample — retake to replace"):
-                    cap["samples"].pop(i)
-                    cap["thumbs"].pop(i)
-                    st.rerun()
-
     if mode.startswith("🎥"):
-        col_btn, col_state = st.columns([2, 3])
-        if st.session_state.get(run_key):
-            if col_btn.button("⏹️ Stop camera", width="stretch"):
-                st.session_state[run_key] = False
-                st.session_state[done_key] = False
-                st.toast("Stopping camera…", icon="⏹️")
-                st.rerun()
-        else:
-            if col_btn.button("▶️ Start auto-capture", type="primary",
-                              width="stretch"):
-                st.session_state[run_key] = True
-                st.session_state[done_key] = False
-                st.rerun()
-        if st.session_state.get(run_key):
-            col_state.caption("🔴 **LIVE** — auto-capturing…")
-
-        camera_input_live(key=f"camw::{pid}")   # persistent live preview
+        done = st.session_state.get(done_key, False)
+        cam_col, side_col = st.columns([3, 2])     # attendance-like proportions
 
         @st.fragment(run_every=3.0)
         def _auto():
             if st.session_state.get(done_key):
-                suggestion_box("✅ All samples captured — review below, then Save.")
+                with cam_col:
+                    suggestion_box("✅ All samples captured — review below, "
+                                   "then Save.")
                 return
-            if not st.session_state.get(run_key):
-                st.caption("📷 Camera off — press ▶️ Start auto-capture.")
-                return
-            try:
-                frame = camera_frame_bgr()
-            except Exception as e:
-                st.error(f"Camera error: {str(e)[:160]}")
-                return
+            with cam_col:
+                # ONE widget instance, inside the fragment, stable key.
+                try:
+                    raw = camera_input_live(key=f"camw::{pid}")
+                except Exception as e:
+                    st.error(f"Camera error: {str(e)[:160]}")
+                    return
+                if raw is None:
+                    st.info("Starting camera… allow the permission pop-up "
+                            "(once).")
+                    return
+            frame = _raw_to_bgr(raw)
             if frame is None:
                 return
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            bright, sharp = float(gray.mean()), float(cv2.Laplacian(gray, cv2.CV_64F).var())
+            bright = float(gray.mean())
+            sharp = float(cv2.Laplacian(gray, cv2.CV_64F).var())
             try:
                 locs, encs = detect_and_encode(rgb, scale=1.0, num_jitters=1)
             except Exception as e:
                 st.error(f"Recognition error: {str(e)[:160]}")
                 return
+
             n = len(cap["samples"])
             if n < cfg.n_samples:
                 good = (len(locs) == 1 and 55 <= bright <= 210 and sharp >= 30)
-                if good and time.time() - st.session_state.get(f"lc::{pid}", 0) > 2.0:
+                if good and time.time() - st.session_state.get(
+                        f"lc::{pid}", 0) > 2.0:
                     cap["samples"].append(encs[0])
-                    cap["thumbs"].append(face_thumb(rgb, locs[0], 72))
+                    cap["thumbs"].append(face_thumb(rgb, locs[0], 96))
                     st.session_state[f"lc::{pid}"] = time.time()
                     n += 1
                     st.toast(f"Sample {n}/{cfg.n_samples} captured", icon="📸")
-                suggestion_box(live_suggestion(len(locs), bright, sharp))
+                with cam_col:
+                    suggestion_box(live_suggestion(len(locs), bright, sharp))
             else:
-                st.session_state[run_key] = False
                 st.session_state[done_key] = True
-                st.rerun()
+                st.rerun(scope="fragment")
 
-            vis = cv2.cvtColor(annotate(
-                cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB),
-                [(l, "sample", True, 0.0) for l in locs]), cv2.COLOR_BGR2RGB)
-            st.image(cv2.resize(vis, (VIS_W, int(VIS_W * vis.shape[0]
-                                                   / max(1, vis.shape[1])))),
-                     width="stretch")
-            st.progress(min(n / cfg.n_samples, 1.0),
-                        text=f"{n}/{cfg.n_samples} samples captured")
+            with cam_col:
+                vis = cv2.cvtColor(annotate(
+                    cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB),
+                    [(l, "ok" if len(locs) == 1 else "?", True, 0.0)
+                     for l in locs]), cv2.COLOR_BGR2RGB)
+                st.image(cv2.resize(vis, (VIS_W, int(VIS_W * vis.shape[0]
+                                                       / max(1, vis.shape[1])))),
+                         width="stretch")
+                st.progress(min(n / cfg.n_samples, 1.0),
+                            text=f"{n}/{cfg.n_samples} samples captured")
+
+            with side_col:
+                st.markdown("**Captured samples**")
+                if not cap["thumbs"]:
+                    st.caption("Thumbnails appear here as quality frames are "
+                               "auto-captured.")
+                else:
+                    for i, tmb in enumerate(cap["thumbs"]):
+                        c1, c2 = st.columns([3, 1])
+                        c1.image(tmb, width="stretch")
+                        if c2.button("✕", key=f"sx::{pid}::{i}",
+                                     help="Delete this sample"):
+                            cap["samples"].pop(i)
+                            cap["thumbs"].pop(i)
+                            st.rerun(scope="fragment")
+                with st.container(border=True):
+                    st.markdown("**Tips** 📸")
+                    st.markdown("• Vary angle & distance between captures\n"
+                                "• Keep a single face, good lighting\n"
+                                "• Auto-capture stops at "
+                                f"{cfg.n_samples}/{cfg.n_samples}")
 
         _auto()
-        _thumb_row()
+
+        if done:
+            if st.button("↺ Capture more", width="stretch"):
+                st.session_state[done_key] = False
+                st.rerun()
     else:
         left, right = st.columns([3, 2])
         with left:
@@ -299,10 +316,18 @@ def capture_section(pid: str, name: str, store: Store, cfg: Config,
                     st.error("No face detected — improve lighting and retake.")
                 else:
                     cap["samples"].append(encs[locs.index(box)])
-                    cap["thumbs"].append(face_thumb(rgb, box, 72))
+                    cap["thumbs"].append(face_thumb(rgb, box, 96))
                     st.rerun()
         with right:
-            _thumb_row()
+            if cap["thumbs"]:
+                for i, tmb in enumerate(cap["thumbs"]):
+                    c1, c2 = st.columns([3, 1])
+                    c1.image(tmb, width="stretch")
+                    if c2.button("✕", key=f"mx::{pid}::{i}",
+                                 help="Delete this sample"):
+                        cap["samples"].pop(i)
+                        cap["thumbs"].pop(i)
+                        st.rerun()
 
     if cap["samples"]:
         st.progress(min(len(cap["samples"]) / cfg.n_samples, 1.0),
@@ -311,9 +336,8 @@ def capture_section(pid: str, name: str, store: Store, cfg: Config,
                      type="primary", width="stretch"):
             store.enroll(pid, name or pid, cap["samples"])
             added = [t for t in class_targets if store.add_to_class(t, pid)]
-            st.session_state.pop(f"cap::{pid}", None)
-            st.session_state.pop(run_key, None)
-            st.session_state.pop(done_key, None)
+            for k in (f"cap::{pid}", f"autodone::{pid}"):
+                st.session_state.pop(k, None)
             msg = f"Saved **{name or pid}** with {len(cap['samples'])} samples."
             if added:
                 msg += f" Added to: {', '.join(added)}."
@@ -344,7 +368,6 @@ if _invite and "user" not in st.session_state:
             st.caption("You can close this page.")
             st.stop()
         st.title(f"🪪 Join {icls['name']}")
-        room_note = ops_room_note = ""
         st.caption("Enter your details and capture your face samples — after "
                    "saving, you're automatically on the class list.")
         c1, c2 = st.columns(2)
@@ -450,7 +473,6 @@ def page_dashboard():
 
     live_panel()
 
-    # Now / Next / Room from the timetable
     if classes:
         cid0 = st.selectbox("Class schedule", list(classes),
                             format_func=lambda c: classes[c]["name"],
@@ -1477,5 +1499,5 @@ with st.sidebar:
     if st.button("Log out", width="stretch"):
         st.session_state.clear()
         st.rerun()
-    st.caption("v2.14-ops · self-hosted · data stays local")
+    st.caption("v2.13.6 · self-hosted · data stays local")
 pg.run()
