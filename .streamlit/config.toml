@@ -1,5 +1,9 @@
 [theme]
-primaryColor = "#4F46E5"
+base = "dark"
+primaryColor = "#6366F1"
+backgroundColor = "#0B1220"
+secondaryBackgroundColor = "#8d88db"
+textColor = "#E5E7EB"
 font = "sans serif"
 
 [client]
@@ -7,3 +11,6 @@ toolbarMode = "minimal"
 
 [browser]
 gatherUsageStats = false
+
+[server]
+maxUploadSize = 25
