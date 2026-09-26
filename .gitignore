@@ -3,6 +3,7 @@ attendance_db/
 demo_db/
 *.xlsx
 *.csv
+models/
 
 # python
 __pycache__/
