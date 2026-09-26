@@ -1,9 +1,11 @@
+# Visual Class Attendance — Streamlit theme & chrome
+# Dark mode is handled in-app by the 🌓 toggle (CSS layer), so the base here
+# stays light. Users who prefer permanent dark can also use ⋮ → Settings → Theme.
+
 [theme]
-base = "dark"
-primaryColor = "#6366F1"
-backgroundColor = "#0B1220"
+base = "light"
+primaryColor = "#4F46E5"
 secondaryBackgroundColor = "#8d88db"
-textColor = "#E5E7EB"
 font = "sans serif"
 
 [client]
