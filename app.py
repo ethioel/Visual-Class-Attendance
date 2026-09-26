@@ -61,7 +61,7 @@ GUEST_DB = "demo_db"
 STATUS_OPTS = ["—", "Present", "Late", "Excused", "Absent"]
 WORK_WIDTH = 960
 LIVE_PROB = 0.85
-VIS_W = 640                      # live preview width (small = no lag)
+VIS_W = 640
 
 
 @st.cache_resource
@@ -130,6 +130,23 @@ def _app_base_url() -> str:
     return ""
 
 
+# ---------------- dark mode (session-driven CSS layer) ----------------
+def _dark_toggle(right: bool = True) -> bool:
+    """Render the toggle and return the effective dark state. Must be called
+    BEFORE inject_css() so the choice applies in the same run."""
+    c1, c2 = st.columns([9, 1]) if right else st.columns([1, 2])
+    with c2:
+        dark = st.toggle("🌓", value=st.session_state.get(
+            "dark_mode", theme_is_dark()), key="dark_toggle",
+            help="Dark mode")
+    st.session_state["dark_mode"] = dark
+    return dark
+
+
+def _dark_active() -> bool:
+    return bool(st.session_state.get("dark_mode", theme_is_dark()))
+
+
 def _render_heatmap(cid: str, month: str):
     df = store.heatmap(cid, month)
     if df.empty:
@@ -139,7 +156,7 @@ def _render_heatmap(cid: str, month: str):
     day_of = {d: d[-2:] for d in dates}
     df["Day"] = df.Date.map(day_of)
     names = df.Name.drop_duplicates().tolist()
-    no_rec = "#334155" if theme_is_dark() else "#E5E7EB"
+    no_rec = "#334155" if _dark_active() else "#E5E7EB"
     chart = (alt.Chart(df).mark_rect(stroke="#94A3B8", strokeWidth=0.3)
              .encode(x=alt.X("Day:O", sort=[day_of[d] for d in dates],
                              axis=alt.Axis(labelAngle=0, title=None,
@@ -278,7 +295,8 @@ def capture_section(pid: str, name: str, store: Store, cfg: Config,
 # ================= INVITE SELF-ENROLL (pre-login) =================
 _invite = st.query_params.get("invite")
 if _invite and "user" not in st.session_state:
-    inject_css(hide_sidebar=True)
+    dark = _dark_toggle(right=False)
+    inject_css(hide_sidebar=True, dark=dark)
     icfg, istore, _ = resources(MAIN_DB)
     icid = istore.class_by_invite(_invite)
     render_flash()
@@ -314,7 +332,8 @@ if _invite and "user" not in st.session_state:
 
 # ================= LOGIN =================
 if "user" not in st.session_state:
-    inject_css(hide_sidebar=True)
+    dark = _dark_toggle(right=False)
+    inject_css(hide_sidebar=True, dark=dark)
     _, _, auth0 = resources(MAIN_DB)
     c1, c2, c3 = st.columns([1, 2.2, 1])
     with c2:
@@ -340,9 +359,11 @@ if "user" not in st.session_state:
 # ================= SESSION =================
 user = st.session_state.user
 guest = user["role"] == "guest"
-inject_css()
+dark = _dark_toggle()                      # top-right toggle, every page
+inject_css(dark=dark)
 cfg, store, auth = resources(GUEST_DB if guest else MAIN_DB)
 render_flash()
+store.actor = user["username"]
 
 if guest and "DEMO" not in store.load_classes():
     store.create_class("DEMO", "Guest demo", "guest")
@@ -351,8 +372,6 @@ classes = (store.load_classes() if user["role"] in ("admin", "guest")
            else store.classes_of(user["username"]))
 people = store.load_people()
 enc_all = store.load_encodings()
-store.actor = user["username"]          # store-internal audits (enroll etc.)
-
 ACTOR = user["username"]
 
 
@@ -368,7 +387,7 @@ def rate_table(cid: str) -> pd.DataFrame:
     return r
 
 
-# ================= DASHBOARD (first-run hero) =================
+# ================= DASHBOARD =================
 def page_dashboard():
     section("📊", "Dashboard")
     if guest:
@@ -451,31 +470,33 @@ def _class_readiness_card(cid: str, cls: dict):
                     "Add existing students to this class", candidates,
                     format_func=lambda p: f"{people[p].get('name', p)} ({p})",
                     key=f"quickadd::{cid}")
-                if pick and st.button("Add to class", key=f"quickaddb::{cid}",
-                                      type="primary"):
+                if pick and st.button("Add to class",
+                                      key=f"quickaddb::{cid}", type="primary"):
                     for p in pick:
                         store.add_to_class(cid, p)
                         store._audit(ACTOR, "add_to_class", f"{cid}/{p}")
                     st.rerun()
-            PAGES.get("Enroll student") and st.page_link(
-                PAGES["Enroll student"],
-                label="➕ …or enroll a new student (select this class)", icon="➕")
-            PAGES.get("Classes") and st.page_link(
-                PAGES["Classes" if user["role"] == "admin" else "My classes"],
-                label="🔗 …or share the class invite link", icon="🔗")
+            if PAGES.get("Enroll student"):
+                st.page_link(PAGES["Enroll student"],
+                             label="➕ …or enroll a new student (select this class)",
+                             icon="➕")
+            if PAGES.get("Classes"):
+                st.page_link(PAGES["Classes" if user["role"] == "admin"
+                                   else "My classes"],
+                             label="🔗 …or share the class invite link", icon="🔗")
         return
     missing = [p for p in students if p not in enc_all]
     if missing:
         names = [people[p].get("name", p) for p in missing]
         shown = ", ".join(names[:8]) + ("…" if len(names) > 8 else "")
         with st.container(border=True):
-            st.warning(f"**{len(missing)} of {len(students)}** students don't have "
-                       f"face samples yet: {shown}")
-            PAGES.get("Students") and st.page_link(
-                PAGES["Students"], label="📷 Capture their face samples now",
-                icon="📷")
+            st.warning(f"**{len(missing)} of {len(students)}** students don't "
+                       f"have face samples yet: {shown}")
+            if PAGES.get("Students"):
+                st.page_link(PAGES["Students"],
+                             label="📷 Capture their face samples now", icon="📷")
     else:
-        st.caption(f"👥 **{len(students)}** students ready for face recognition.")
+        st.caption(f"👥 **{len(students)}** students ready for recognition.")
 
 
 def page_attendance():
@@ -492,7 +513,6 @@ def page_attendance():
                        format_func=lambda c: f"{classes[c]['name']} · {c}")
     cls = classes[cid]
 
-    # ---- inline late-time editor ----
     cL1, cL2, cL3 = st.columns([2, 2, 3])
     cur = cls.get("late_after") or ""
     hh, mm = (cur.split(":") + ["00"])[:2] if cur else ("09", "00")
@@ -597,8 +617,7 @@ def _live_session(cid: str, cls: dict, enc: dict, tolerance: float,
     key = f"session::{cid}"
     sess = st.session_state.setdefault(key, {"started": False, "log": [],
                                              "captures": 0, "unknown": 0,
-                                             "last_emb": None, "vis": None,
-                                             "vis_tick": -1})
+                                             "last_emb": None, "vis": None})
     summary_key = f"summary::{cid}"
     status = store.status_now(cls.get("late_after"))
     if not enc:
@@ -621,7 +640,7 @@ def _live_session(cid: str, cls: dict, enc: dict, tolerance: float,
                 if st.button("▶️ Start live session", type="primary",
                              width="stretch"):
                     sess.update(started=True, log=[], captures=0, unknown=0,
-                                last_emb=None, vis=None, vis_tick=-1)
+                                last_emb=None, vis=None)
                     st.session_state.pop(summary_key, None)
                     st.rerun()
 
@@ -645,7 +664,6 @@ def _live_session(cid: str, cls: dict, enc: dict, tolerance: float,
                 work, _ = to_working(rgb)
                 locs, encs = detect_and_encode(work, scale=1.0,
                                                prob_threshold=LIVE_PROB)
-                # --- liveness: embedding must differ from previous frame ---
                 live_ok = True
                 if liveness > 0 and encs:
                     ref = sess.get("last_emb")
@@ -671,15 +689,15 @@ def _live_session(cid: str, cls: dict, enc: dict, tolerance: float,
                 st.warning("🛡️ Still frame detected — move naturally; not "
                            "marking from frozen images.")
 
-            # --- preview: update only on meaningful change, small image ---
-            changed = bool([r for r in results if r[2]]) or \
-                      any(not r[2] for r in results)
-            if changed or sess["vis"] is None or tick % 3 == 0:
+            # preview: small, refreshed on meaningful change + heartbeat
+            has_content = any(r[2] for r in results) or \
+                any(not r[2] for r in results)
+            if has_content or sess["vis"] is None or tick % 3 == 0:
                 vis = cv2.cvtColor(
                     annotate(cv2.cvtColor(work, cv2.COLOR_RGB2BGR), results),
                     cv2.COLOR_BGR2RGB)
-                sess["vis"] = cv2.resize(vis, (VIS_W, int(VIS_W * vis.shape[0]
-                                                            / max(1, vis.shape[1]))))
+                sess["vis"] = cv2.resize(
+                    vis, (VIS_W, int(VIS_W * vis.shape[0] / max(1, vis.shape[1]))))
             if sess["vis"] is not None:
                 st.image(sess["vis"], width="stretch")
 
@@ -1287,5 +1305,5 @@ with st.sidebar:
     if st.button("Log out", width="stretch"):
         st.session_state.clear()
         st.rerun()
-    st.caption("v2.13.1 · self-hosted · data stays local")
+    st.caption("v2.13.2 · self-hosted · data stays local")
 pg.run()
