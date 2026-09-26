@@ -1,5 +1,3 @@
-"""Presentation helpers: theme-aware CSS, pills, sections, empty states,
-thumbnails."""
 from __future__ import annotations
 
 import cv2
@@ -77,7 +75,9 @@ _HIDE_SIDEBAR = 'section[data-testid="stSidebar"]{display:none!important;}'
 
 
 def inject_css(hide_sidebar: bool = False, dark: "bool | None" = None) -> None:
-    """dark=None → follow Streamlit's theme; True/False → force our layer."""
+    """dark=None → follow Streamlit's theme; True/False → force our layer.
+    (app.py ships its own _inject_css on top of these constants, so a stale
+    ui.py can no longer break the dark toggle.)"""
     d = theme_is_dark() if dark is None else dark
     css = _CSS + (_DARK if d else "") + (_HIDE_SIDEBAR if hide_sidebar else "")
     st.markdown(f"<style>{css}</style>", unsafe_allow_html=True)
@@ -105,7 +105,6 @@ def user_chip(user: dict) -> None:
 
 
 def empty_state(icon: str, title: str, hint: str = "") -> None:
-    """Compact in-place empty state for panels and tabs."""
     st.markdown(f'<div style="text-align:center;padding:2.2rem 1rem;">'
                 f'<div style="font-size:2.2rem;">{icon}</div>'
                 f'<div style="font-weight:700;margin:.4rem 0;">{title}</div>'
@@ -114,9 +113,7 @@ def empty_state(icon: str, title: str, hint: str = "") -> None:
 
 def empty_data_hero(title: str, lines: list, cta_label: str = "",
                     cta_page: str = "") -> None:
-    """First-run zero-data hero: up to three numbered setup steps. The CTA is
-    an anchor (styling only); navigation happens via st.page_link next to it
-    when the caller wants a button that actually switches pages."""
+    """First-run zero-data hero with numbered setup steps."""
     items = "".join(f"<li style='margin:.3rem 0'>{l}</li>" for l in lines)
     cta = (f'<span style="display:inline-block;margin-top:1rem;'
            f'background:linear-gradient(135deg,#4F46E5,#6366F1);color:#fff;'
