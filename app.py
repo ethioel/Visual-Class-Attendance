@@ -140,7 +140,7 @@ def _app_base_url() -> str:
     return ""
 
 
-# ---------------- theming (self-contained) ----------------
+# ---------------- theming: single source of truth = CSS variables ----------
 def _theme_is_dark() -> bool:
     try:
         return str(getattr(st.context.theme, "type", "light")).lower() == "dark"
@@ -149,13 +149,15 @@ def _theme_is_dark() -> bool:
 
 
 def _inject_css(hide_sidebar: bool = False, dark=None) -> None:
-    d = _theme_is_dark() if dark is None else dark
+    """Delegates to ui.inject_css, which emits ONLY variable overrides +
+    variable-driven custom CSS. Widgets and custom elements consume the same
+    variables → theme desync (white-on-white) is structurally impossible.
+    Safe against stale ui.py too: falls back to native theme, never crashes."""
     try:
-        from attendance.ui import _CSS, _DARK, _HIDE_SIDEBAR
+        from attendance.ui import inject_css as _ui_css
+        _ui_css(hide_sidebar=hide_sidebar, dark=dark)
     except Exception:
-        _CSS = _DARK = _HIDE_SIDEBAR = ""
-    css = _CSS + (_DARK if d else "") + (_HIDE_SIDEBAR if hide_sidebar else "")
-    st.markdown(f"<style>{css}</style>", unsafe_allow_html=True)
+        pass                                        # native theme still fine
 
 
 def _dark_toggle(right: bool = True) -> bool:
@@ -200,10 +202,10 @@ def _render_heatmap(cid: str, month: str):
 
 def capture_section(pid: str, name: str, store: Store, cfg: Config,
                     class_targets=None, on_saved=None):
-    """Hands-free enrollment: one in-fragment camera widget at attendance-like
-    width. Outside containers are st.empty() (claimed on the full run, filled
-    by the fragment) — Streamlit's required pattern. Completion state is read
-    INSIDE the fragment, so it always renders."""
+    """Hands-free enrollment. All capture layout lives INSIDE the fragment
+    (fragment-owned containers — immune to outside-write errors). Save button
+    lives in-fragment too, so partial saves always work; _do_save clears the
+    form inputs so the camera does not restart for a stale entry."""
     class_targets = class_targets or []
     cap = st.session_state.setdefault(f"cap::{pid}", {"samples": [], "thumbs": []})
     done_key = f"autodone::{pid}"
@@ -211,38 +213,54 @@ def capture_section(pid: str, name: str, store: Store, cfg: Config,
                     ["🎥 Auto-capture (hands-free)", "📷 Manual snapshots"],
                     horizontal=True, key=f"cmode::{pid}")
 
+    def _do_save():
+        store.enroll(pid, name or pid, cap["samples"])
+        added = [t for t in class_targets if store.add_to_class(t, pid)]
+        for k in (f"cap::{pid}", f"autodone::{pid}"):
+            st.session_state.pop(k, None)
+        st.session_state.pop("pname", None)
+        st.session_state.pop("pid", None)
+        msg = f"Saved **{name or pid}** with {len(cap['samples'])} samples."
+        if added:
+            msg += f" Added to: {', '.join(added)}."
+        flash("success" if added else "warning", msg)
+        if on_saved:
+            on_saved(pid)
+
     if mode.startswith("🎥"):
-        cam_col, side_col = st.columns([3, 2])
-        # Claim slots on the FULL run so the fragment can write into them.
-        cam_slot = cam_col.empty()
-        side_slot = side_col.empty()
 
         @st.fragment(run_every=3.0)
         def _auto():
-            if st.session_state.get(done_key, False):
-                cam_slot.container(border=True).markdown(
-                    "✅ **All samples captured** — review them on the right, "
-                    "then press **Save**.")
-                with side_slot.container():
-                    if cap["thumbs"]:
-                        st.markdown("**Captured samples**")
-                        for i, tmb in enumerate(cap["thumbs"]):
-                            c1, c2 = st.columns([3, 1])
-                            c1.image(tmb, width="stretch")
-                            if c2.button("✕", key=f"dx::{pid}::{i}",
-                                         help="Delete this sample"):
-                                cap["samples"].pop(i)
-                                cap["thumbs"].pop(i)
-                                st.rerun(scope="fragment")
-                    else:
-                        st.caption("No samples yet.")
+            done = st.session_state.get(done_key, False)
+            cam_col, side_col = st.columns([3, 2])   # fragment-owned layout
+
+            if done:
+                with cam_col:
+                    st.container(border=True).markdown(
+                        "✅ **All samples captured** — review on the right, "
+                        "then press **Save**.")
+                with side_col:
+                    st.markdown("**Captured samples**")
+                    for i, tmb in enumerate(cap["thumbs"]):
+                        c1, c2 = st.columns([3, 1])
+                        c1.image(tmb, width="stretch")
+                        if c2.button("✕", key=f"dx::{pid}::{i}",
+                                     help="Delete this sample"):
+                            cap["samples"].pop(i)
+                            cap["thumbs"].pop(i)
+                            st.rerun(scope="fragment")
+                    if st.button(f"💾 Save {len(cap['samples'])} sample(s) "
+                                 f"for {name or pid}", type="primary",
+                                 width="stretch", key=f"svd::{pid}"):
+                        _do_save()
+                        st.rerun()
                     if st.button("↺ Capture more", key=f"more::{pid}",
                                  width="stretch"):
                         st.session_state[done_key] = False
                         st.rerun(scope="fragment")
                 return
 
-            with cam_slot.container():
+            with cam_col:
                 try:
                     raw = camera_input_live(key=f"camw::{pid}")
                 except Exception as e:
@@ -277,9 +295,9 @@ def capture_section(pid: str, name: str, store: Store, cfg: Config,
                     st.toast(f"Sample {n}/{cfg.n_samples} captured", icon="📸")
             else:
                 st.session_state[done_key] = True
-                st.rerun(scope="fragment")
+                st.rerun()                       # one full rerun → Save visible
 
-            with cam_slot.container():
+            with cam_col:
                 suggestion_box(live_suggestion(len(locs), bright, sharp))
                 vis = cv2.cvtColor(annotate(
                     cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB),
@@ -291,7 +309,7 @@ def capture_section(pid: str, name: str, store: Store, cfg: Config,
                 st.progress(min(n / cfg.n_samples, 1.0),
                             text=f"{n}/{cfg.n_samples} samples captured")
 
-            with side_slot.container():
+            with side_col:
                 st.markdown("**Captured samples**")
                 if cap["thumbs"]:
                     for i, tmb in enumerate(cap["thumbs"]):
@@ -305,6 +323,11 @@ def capture_section(pid: str, name: str, store: Store, cfg: Config,
                 else:
                     st.caption("Thumbnails appear here as quality frames are "
                                "auto-captured.")
+                if st.button(f"💾 Save {len(cap['samples'])} sample(s) now",
+                             type="primary", width="stretch",
+                             key=f"sv::{pid}", disabled=len(cap["samples"]) == 0):
+                    _do_save()
+                    st.rerun()
                 with st.container(border=True):
                     st.markdown("**Tips** 📸")
                     st.markdown("• Vary angle & distance between captures\n"
@@ -338,23 +361,13 @@ def capture_section(pid: str, name: str, store: Store, cfg: Config,
                         cap["samples"].pop(i)
                         cap["thumbs"].pop(i)
                         st.rerun()
-
-    if cap["samples"]:
-        st.progress(min(len(cap["samples"]) / cfg.n_samples, 1.0),
-                    text=f"{len(cap['samples'])}/{cfg.n_samples} samples captured")
-        if st.button(f"💾 Save {len(cap['samples'])} sample(s) for {name or pid}",
-                     type="primary", width="stretch"):
-            store.enroll(pid, name or pid, cap["samples"])
-            added = [t for t in class_targets if store.add_to_class(t, pid)]
-            for k in (f"cap::{pid}", f"autodone::{pid}"):
-                st.session_state.pop(k, None)
-            msg = f"Saved **{name or pid}** with {len(cap['samples'])} samples."
-            if added:
-                msg += f" Added to: {', '.join(added)}."
-            flash("success" if added else "warning", msg)
-            if on_saved:
-                on_saved(pid)
-            st.rerun()
+        if cap["samples"]:
+            st.progress(min(len(cap["samples"]) / cfg.n_samples, 1.0),
+                        text=f"{len(cap['samples'])}/{cfg.n_samples} samples captured")
+            if st.button(f"💾 Save {len(cap['samples'])} sample(s) for {name or pid}",
+                         type="primary", width="stretch"):
+                _do_save()
+                st.rerun()
 
 
 # ================= INVITE CLASS PORTAL (pre-login) =================
@@ -1509,5 +1522,5 @@ with st.sidebar:
     if st.button("Log out", width="stretch"):
         st.session_state.clear()
         st.rerun()
-    st.caption("v2.13.8 · self-hosted · data stays local")
+    st.caption("v2.15.0 · self-hosted · data stays local")
 pg.run()
