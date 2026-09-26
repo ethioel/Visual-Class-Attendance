@@ -76,8 +76,10 @@ div[data-testid="stVerticalBlockBorderWrapper"]{background:#111827;border-color:
 _HIDE_SIDEBAR = 'section[data-testid="stSidebar"]{display:none!important;}'
 
 
-def inject_css(hide_sidebar: bool = False) -> None:
-    css = _CSS + (_DARK if theme_is_dark() else "") + (_HIDE_SIDEBAR if hide_sidebar else "")
+def inject_css(hide_sidebar: bool = False, dark: "bool | None" = None) -> None:
+    """dark=None → follow Streamlit's theme; True/False → force our layer."""
+    d = theme_is_dark() if dark is None else dark
+    css = _CSS + (_DARK if d else "") + (_HIDE_SIDEBAR if hide_sidebar else "")
     st.markdown(f"<style>{css}</style>", unsafe_allow_html=True)
 
 
