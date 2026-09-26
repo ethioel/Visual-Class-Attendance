@@ -50,8 +50,8 @@ from attendance.engine import (annotate, best_match, detect_and_encode,
                                largest_face, recognize)
 from attendance.store import Store
 from attendance.ui import (STATUS_EMOJI, empty_data_hero, empty_state,
-                           face_thumb, flash, hero, inject_css, render_flash,
-                           section, suggestion_box, theme_is_dark, user_chip)
+                           face_thumb, flash, hero, render_flash, section,
+                           suggestion_box, user_chip)
 
 st.set_page_config(page_title="Visual Attendance", page_icon="🪪", layout="wide",
                    initial_sidebar_state="collapsed")
@@ -130,21 +130,41 @@ def _app_base_url() -> str:
     return ""
 
 
-# ---------------- dark mode (session-driven CSS layer) ----------------
+# ---------------- theming (self-contained; immune to ui.py version) --------
+def _theme_is_dark() -> bool:
+    try:
+        return str(getattr(st.context.theme, "type", "light")).lower() == "dark"
+    except Exception:
+        return False
+
+
+def _inject_css(hide_sidebar: bool = False, dark=None) -> None:
+    """Self-contained CSS injection. Raw constants live in attendance.ui and
+    have been stable since v2.3; if even those are missing, the app still
+    runs unstyled rather than crashing. dark=None → follow Streamlit theme;
+    True/False → force our layer."""
+    d = _theme_is_dark() if dark is None else dark
+    try:
+        from attendance.ui import _CSS, _DARK, _HIDE_SIDEBAR
+    except Exception:
+        _CSS = _DARK = _HIDE_SIDEBAR = ""
+    css = _CSS + (_DARK if d else "") + (_HIDE_SIDEBAR if hide_sidebar else "")
+    st.markdown(f"<style>{css}</style>", unsafe_allow_html=True)
+
+
 def _dark_toggle(right: bool = True) -> bool:
-    """Render the toggle and return the effective dark state. Must be called
-    BEFORE inject_css() so the choice applies in the same run."""
+    """Render the 🌓 toggle; returns the effective dark state. Must be called
+    BEFORE _inject_css() so the choice applies in the same run."""
     c1, c2 = st.columns([9, 1]) if right else st.columns([1, 2])
     with c2:
         dark = st.toggle("🌓", value=st.session_state.get(
-            "dark_mode", theme_is_dark()), key="dark_toggle",
-            help="Dark mode")
+            "dark_mode", _theme_is_dark()), key="dark_toggle", help="Dark mode")
     st.session_state["dark_mode"] = dark
     return dark
 
 
 def _dark_active() -> bool:
-    return bool(st.session_state.get("dark_mode", theme_is_dark()))
+    return bool(st.session_state.get("dark_mode", _theme_is_dark()))
 
 
 def _render_heatmap(cid: str, month: str):
@@ -296,7 +316,7 @@ def capture_section(pid: str, name: str, store: Store, cfg: Config,
 _invite = st.query_params.get("invite")
 if _invite and "user" not in st.session_state:
     dark = _dark_toggle(right=False)
-    inject_css(hide_sidebar=True, dark=dark)
+    _inject_css(hide_sidebar=True, dark=dark)
     icfg, istore, _ = resources(MAIN_DB)
     icid = istore.class_by_invite(_invite)
     render_flash()
@@ -333,7 +353,7 @@ if _invite and "user" not in st.session_state:
 # ================= LOGIN =================
 if "user" not in st.session_state:
     dark = _dark_toggle(right=False)
-    inject_css(hide_sidebar=True, dark=dark)
+    _inject_css(hide_sidebar=True, dark=dark)
     _, _, auth0 = resources(MAIN_DB)
     c1, c2, c3 = st.columns([1, 2.2, 1])
     with c2:
@@ -359,8 +379,8 @@ if "user" not in st.session_state:
 # ================= SESSION =================
 user = st.session_state.user
 guest = user["role"] == "guest"
-dark = _dark_toggle()                      # top-right toggle, every page
-inject_css(dark=dark)
+dark = _dark_toggle()
+_inject_css(dark=dark)
 cfg, store, auth = resources(GUEST_DB if guest else MAIN_DB)
 render_flash()
 store.actor = user["username"]
@@ -689,7 +709,6 @@ def _live_session(cid: str, cls: dict, enc: dict, tolerance: float,
                 st.warning("🛡️ Still frame detected — move naturally; not "
                            "marking from frozen images.")
 
-            # preview: small, refreshed on meaningful change + heartbeat
             has_content = any(r[2] for r in results) or \
                 any(not r[2] for r in results)
             if has_content or sess["vis"] is None or tick % 3 == 0:
@@ -1305,5 +1324,5 @@ with st.sidebar:
     if st.button("Log out", width="stretch"):
         st.session_state.clear()
         st.rerun()
-    st.caption("v2.13.2 · self-hosted · data stays local")
+    st.caption("v2.13.3 · self-hosted · data stays local")
 pg.run()
