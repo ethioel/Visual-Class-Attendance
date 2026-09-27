@@ -16,13 +16,13 @@ from .config import Config
 from .engine import BACKEND_ID
 
 COLS = ["Date", "Time", "Class", "ID", "Name", "Status"]
-ACTIVE_STATUSES = ("Present", "Late", "Excused")   # any of these blocks auto-marks
+ACTIVE_STATUSES = ("Present", "Late", "Excused")
 
-_INVITE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"   # no 0/O, 1/I
+_INVITE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 
 
 def _atomic_dump(path: str, mode: str, writer) -> None:
-    """Temp file in same dir → fsync → atomic replace (crash-safe)."""
+    """Temp file in same dir -> fsync -> atomic replace (crash-safe)."""
     directory = os.path.dirname(os.path.abspath(path))
     os.makedirs(directory, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=directory, suffix=".tmp")
@@ -46,10 +46,10 @@ class Store:
         self.cfg = cfg
         cfg.ensure_dirs()
         self._lock = threading.RLock()
-        # Optional attribution for store-internal audits. The app sets
-        # store.actor = username; defaults to "system".
+        # Attribution for store-internal audits (app sets store.actor).
         self.actor: str = "system"
-        self._marked: Set[Tuple[str, str, str]] = set()   # (date, class, id)
+        # (date, class, id) duplicate-guard cache
+        self._marked: Set[Tuple[str, str, str]] = set()
         df = self._read_csv()
         if not df.empty:
             done = df[(df.Date == self._today()) & (df.Status.isin(ACTIVE_STATUSES))]
@@ -61,7 +61,7 @@ class Store:
         return os.path.join(self.cfg.db_dir, "audit.csv")
 
     def _audit(self, actor: str, action: str, detail: str = "") -> None:
-        """Append-only audit trail. Never raises — auditing must not break ops."""
+        """Append-only audit trail. Never raises."""
         try:
             ts = self.cfg.now().isoformat(timespec="seconds")
             new = not os.path.exists(self.audit_file)
@@ -95,8 +95,7 @@ class Store:
 
     def enroll(self, person_id: str, name: str, encodings: List[np.ndarray]) -> None:
         """Add face samples. Creates the person if new; appends + updates the
-        display name if they already exist. Stamps the backend ID and writes
-        one audit entry (call sites do not audit enrollment)."""
+        display name if they already exist. Stamps the backend ID; self-audits."""
         if not encodings:
             return
         with self._lock:
@@ -118,8 +117,7 @@ class Store:
                     f"{person_id} +{len(encodings)} samples")
 
     def remove_person(self, person_id: str) -> bool:
-        """Low-level removal (library use). The UI uses delete_student(),
-        which additionally scrubs attendance history."""
+        """Low-level removal (library use only; UI uses delete_student)."""
         with self._lock:
             people = self.load_people()
             if person_id not in people:
@@ -142,8 +140,8 @@ class Store:
     def delete_student(self, person_id: str, actor: str = "system") -> Optional[dict]:
         """Remove a student, their encodings, and every roster membership.
         Attendance rows are KEPT but the Name is scrubbed to '(removed
-        student)' so history stays readable. Returns a summary of what was
-        deleted (for the confirmation/audit trail), or None if unknown ID."""
+        student)' so history stays readable. Returns a deletion summary,
+        or None if unknown ID. Self-audits with the given actor."""
         with self._lock:
             people = self.load_people()
             if person_id not in people:
@@ -168,8 +166,7 @@ class Store:
                 if person_id in cls.get("students", []):
                     cls["students"].remove(person_id)
             self._save_classes(classes)
-            # drop in-memory duplicate-guard entries so a same-day
-            # re-enrollment with the same ID works cleanly
+            # clear in-memory duplicate guard so same-day re-enroll works
             self._marked = {k for k in self._marked if k[2] != person_id}
         self._sync_excel()
         self._audit(actor, "delete_student",
@@ -204,7 +201,7 @@ class Store:
         return {pid: len(v) for pid, v in enc.items()}
 
     def pending_samples(self, min_samples: Optional[int] = None) -> Dict[str, dict]:
-        """People who still need photo samples (batch-import follow-up)."""
+        """People who still need photo samples."""
         need = min_samples or self.cfg.n_samples
         counts = self.sample_counts()
         return {pid: info for pid, info in self.load_people().items()
@@ -212,8 +209,7 @@ class Store:
 
     # ======================= encodings =======================
     def load_encodings(self) -> Dict[str, List[np.ndarray]]:
-        """Only encodings whose person is stamped with the CURRENT backend —
-        older-backend samples are invisible (never matched, never crash)."""
+        """Only encodings whose person is stamped with the CURRENT backend."""
         with self._lock:
             people = self.load_people()
             if not os.path.exists(self.cfg.enc_cache):
@@ -302,7 +298,6 @@ class Store:
         return "".join(secrets.choice(_INVITE_ALPHABET) for _ in range(6))
 
     def ensure_class_invite(self, class_id: str) -> Optional[str]:
-        """Return the class's invite code, creating one if needed."""
         with self._lock:
             classes = self.load_classes()
             cls = classes.get(class_id)
@@ -314,7 +309,6 @@ class Store:
             return cls["invite"]
 
     def regenerate_invite(self, class_id: str) -> Optional[str]:
-        """Invalidate the old link and issue a fresh code."""
         with self._lock:
             classes = self.load_classes()
             if class_id not in classes:
@@ -383,9 +377,8 @@ class Store:
 
     def mark(self, person_id: str, name: str, status: Optional[str] = None,
              class_id: str = "GENERAL") -> bool:
-        """Append one record. False if this person already has one today (in
-        this class) — including Excused, which auto-marks never overwrite.
-        Auditing happens at the call site, where the actor is known."""
+        """Append one record. False if already marked today (in this class),
+        including Excused. Audited at the call site."""
         today, status = self._today(), (status or self.status_now())
         now_t = self.cfg.now().strftime("%H:%M:%S")
         with self._lock:
@@ -412,9 +405,8 @@ class Store:
 
     def set_status(self, person_id: str, name: str, status: Optional[str],
                    class_id: str = "GENERAL", date: Optional[str] = None) -> bool:
-        """Upsert a record with an explicit status. status=None removes the row
-        (unmarks, so a later scan can re-mark). Excused upserts like
-        Present/Late — only ever set manually. Audited at the call site."""
+        """Upsert with explicit status. status=None removes the row.
+        Excused upserts like Present/Late. Audited at the call site."""
         date = date or self._today()
         now_t = self.cfg.now().strftime("%H:%M:%S")
         with self._lock:
@@ -429,7 +421,7 @@ class Store:
                         "ID": person_id, "Name": name, "Status": status}])],
                         ignore_index=True)
                 self._marked.add((date, class_id, person_id))
-            else:                                      # unmark / remove
+            else:
                 df = df[~mask]
                 self._marked.discard((date, class_id, person_id))
             _atomic_dump(self.cfg.attendance_csv, "w",
@@ -439,8 +431,7 @@ class Store:
         return True
 
     def delete_records(self, row_indices: List[int]) -> int:
-        """Delete attendance rows by positional index into the full CSV frame.
-        Audited at the call site."""
+        """Delete attendance rows by positional index. Audited at call site."""
         with self._lock:
             df = self._read_csv()
             if df.empty:
@@ -465,8 +456,7 @@ class Store:
         return set(df[m].ID)
 
     def mark_absent_all(self, class_id: Optional[str] = None) -> int:
-        """Absent per roster. class_id=None → every class, plus unassigned
-        people as GENERAL (keeps the CLI flow working without classes)."""
+        """Absent per roster. None -> every class + unassigned as GENERAL."""
         people, classes = self.load_people(), self.load_classes()
         if class_id:
             targets = {class_id: classes.get(class_id, {"students": []})}
@@ -505,8 +495,7 @@ class Store:
         return pd.DataFrame(rows).sort_values("Rate")
 
     def heatmap(self, class_id: str, year_month: Optional[str] = None) -> pd.DataFrame:
-        """Students × days grid for one month. Status per cell;
-        'No record' where the student simply wasn't scanned that day."""
+        """Students x days grid for one month."""
         df = self.records_df(class_id)
         people = self.load_people()
         roster = self.load_classes().get(class_id, {}).get("students", [])
@@ -572,18 +561,17 @@ class Store:
         except Exception:
             return False
 
-    # ======================= exports / backup =======================
+    # ======================= exports / cloud backup =======================
     def _sync_excel(self) -> None:
         try:
             df = self.records_df()
             _atomic_dump(self.cfg.attendance_xlsx, "wb",
                          lambda f: df.to_excel(f, index=False, engine="openpyxl"))
         except Exception:
-            pass                                    # CSV remains the source of truth
+            pass                                    # CSV remains source of truth
 
     def _backup(self) -> None:
-        """Optional: push the CSV to a HF Dataset repo on every record
-        (activated only when HF_TOKEN + HF_DATASET_REPO are set)."""
+        """Optional HF Dataset backup (only when HF_TOKEN + HF_DATASET_REPO set)."""
         repo, token = os.environ.get("HF_DATASET_REPO"), os.environ.get("HF_TOKEN")
         if not (repo and token):
             return
