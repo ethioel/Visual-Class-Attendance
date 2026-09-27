@@ -46,8 +46,8 @@ class Store:
         self.cfg = cfg
         cfg.ensure_dirs()
         self._lock = threading.RLock()
-        # Optional attribution for store-internal audits (enroll). The app may
-        # set store.actor = username; defaults to "system".
+        # Optional attribution for store-internal audits. The app sets
+        # store.actor = username; defaults to "system".
         self.actor: str = "system"
         self._marked: Set[Tuple[str, str, str]] = set()   # (date, class, id)
         df = self._read_csv()
@@ -118,7 +118,8 @@ class Store:
                     f"{person_id} +{len(encodings)} samples")
 
     def remove_person(self, person_id: str) -> bool:
-        """Remove a person, their encodings, and every roster membership."""
+        """Low-level removal (library use). The UI uses delete_student(),
+        which additionally scrubs attendance history."""
         with self._lock:
             people = self.load_people()
             if person_id not in people:
@@ -136,8 +137,46 @@ class Store:
                     changed = True
             if changed:
                 self._save_classes(classes)
-        self._audit(getattr(self, "actor", "system"), "remove_person", person_id)
         return True
+
+    def delete_student(self, person_id: str, actor: str = "system") -> Optional[dict]:
+        """Remove a student, their encodings, and every roster membership.
+        Attendance rows are KEPT but the Name is scrubbed to '(removed
+        student)' so history stays readable. Returns a summary of what was
+        deleted (for the confirmation/audit trail), or None if unknown ID."""
+        with self._lock:
+            people = self.load_people()
+            if person_id not in people:
+                return None
+            name = people[person_id].get("name", person_id)
+            enc = self.load_encodings()
+            n_samples = len(enc.get(person_id, []))
+            classes = self.load_classes()
+            in_classes = [cid for cid, cls in classes.items()
+                          if person_id in cls.get("students", [])]
+            df = self._read_csv()
+            n_records = int((df.ID == person_id).sum()) if not df.empty else 0
+            if n_records:
+                df.loc[df.ID == person_id, "Name"] = "(removed student)"
+                _atomic_dump(self.cfg.attendance_csv, "w",
+                             lambda f: df.to_csv(f, index=False))
+            people.pop(person_id)
+            self.save_people(people)
+            enc.pop(person_id, None)
+            self.save_encodings(enc)
+            for cls in classes.values():
+                if person_id in cls.get("students", []):
+                    cls["students"].remove(person_id)
+            self._save_classes(classes)
+            # drop in-memory duplicate-guard entries so a same-day
+            # re-enrollment with the same ID works cleanly
+            self._marked = {k for k in self._marked if k[2] != person_id}
+        self._sync_excel()
+        self._audit(actor, "delete_student",
+                    f"{person_id} ({name}) samples={n_samples} "
+                    f"classes={','.join(in_classes) or '-'} records={n_records}")
+        return {"name": name, "samples": n_samples,
+                "classes": in_classes, "records": n_records}
 
     def ensure_person(self, person_id: str, name: str) -> bool:
         """Create a person record without face samples (batch import)."""
@@ -400,8 +439,8 @@ class Store:
         return True
 
     def delete_records(self, row_indices: List[int]) -> int:
-        """Delete attendance rows by positional index into the full CSV frame
-        (RangeIndex → positions and labels coincide). Audited at call site."""
+        """Delete attendance rows by positional index into the full CSV frame.
+        Audited at the call site."""
         with self._lock:
             df = self._read_csv()
             if df.empty:
@@ -419,8 +458,6 @@ class Store:
         return len(drop)
 
     def _present_today(self, class_id: str) -> Set[str]:
-        """IDs with any daytime status — 'mark absent' must never touch
-        students who are Present, Late, or Excused."""
         df = self.records_df(class_id)
         if df.empty:
             return set()
@@ -449,9 +486,7 @@ class Store:
         return count
 
     def attendance_rates(self, class_id: str) -> pd.DataFrame:
-        """Rate = attended / (sessions - excused sessions). Excused sessions
-        are removed from the denominator instead of counting against the
-        student."""
+        """Rate = attended / (sessions - excused sessions)."""
         df = self.records_df(class_id)
         people = self.load_people()
         roster = self.load_classes().get(class_id, {}).get("students", [])
@@ -491,8 +526,6 @@ class Store:
 
     # ======================= backup / restore =======================
     def backup_zip(self) -> bytes:
-        """Full db snapshot (people, encodings, classes, records, settings,
-        audit)."""
         import io
         import zipfile
         buf = io.BytesIO()
@@ -505,8 +538,6 @@ class Store:
         return buf.getvalue()
 
     def restore_zip(self, data: bytes, actor: str = "system") -> bool:
-        """Replace current db contents from a backup zip. Destructive — the
-        caller must confirm. Restores to temp files then atomic-swaps."""
         import io
         import zipfile
         try:
