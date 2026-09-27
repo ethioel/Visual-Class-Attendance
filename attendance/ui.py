@@ -14,13 +14,17 @@ def theme_is_dark() -> bool:
 
 # ---- variable overrides (the ONLY theme-dependent CSS in the app) --------
 _VARS_DARK = """
-:root{--background-color:#0B1220!important;--secondary-background-color:#111827!important;
+:root, [data-testid="stAppViewContainer"], [data-testid="stHeader"],
+[data-testid="stSidebar"], section.stMain, [data-testid="stAppViewContainer"] > div {
+--background-color:#0B1220!important;--secondary-background-color:#111827!important;
 --text-color:#E5E7EB!important;--primary-color:#6366F1!important;
 --att-border:rgba(148,163,184,.28)!important;--att-muted:#94A3B8!important;}
 """
 
 _VARS_LIGHT = """
-:root{--background-color:#FFFFFF!important;--secondary-background-color:#F1F5F9!important;
+:root, [data-testid="stAppViewContainer"], [data-testid="stHeader"],
+[data-testid="stSidebar"], section.stMain, [data-testid="stAppViewContainer"] > div {
+--background-color:#FFFFFF!important;--secondary-background-color:#F1F5F9!important;
 --text-color:#0F172A!important;--primary-color:#4F46E5!important;
 --att-border:rgba(15,23,42,.14)!important;--att-muted:#64748B!important;}
 """
