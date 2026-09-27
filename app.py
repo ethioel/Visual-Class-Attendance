@@ -1087,17 +1087,27 @@ def page_students():
                       "🟡 Partial" if n > 0 else
                       "🔴 Needs recapture" if info.get("backend") else
                       "⚪ No samples")
-            rows.append({"ID": p, "Name": info.get("name", p),
+            rows.append({"🗑️": False, "ID": p,
+                         "Name": info.get("name", p),
                          "Samples": n, "Status": status})
         base = pd.DataFrame(rows)
         if base.empty:
             empty_state("👥", "No students yet",
                         "Enroll, import, or share a class invite link.")
         else:
-            ed = st.data_editor(base, disabled=["ID", "Samples", "Status"],
+            st.caption("Tick **🗑️** to mark a student for deletion, then "
+                       "press Delete below. Re-enroll adds fresh samples to "
+                       "an existing student (never replaces, never auto-"
+                       "deletes).")
+            ed = st.data_editor(base, disabled=["ID", "Name", "Samples",
+                                                "Status"],
                                 hide_index=True, width="stretch",
-                                num_rows="fixed", key="edit_people")
-            if st.button("💾 Save name changes"):
+                                num_rows="fixed", key="edit_people",
+                                column_config={"🗑️": st.column_config.CheckboxColumn(
+                                    "Delete", default=False,
+                                    help="Mark for deletion")})
+            c1, c2, c3 = st.columns(3)
+            if c1.button("💾 Save name changes"):
                 n = 0
                 for _, row in ed.iterrows():
                     orig = base.loc[base.ID == row["ID"], "Name"]
@@ -1108,32 +1118,19 @@ def page_students():
                 flash("success" if n else "info",
                       f"Renamed {n} student(s)." if n else "No changes.")
                 st.rerun()
-            st.divider()
-            st.markdown("**🔄 Re-enroll** — capture fresh samples for an "
-                        "existing student (samples are *added*, never "
-                        "replaced).")
-            target = st.selectbox(
-                "Student", [""] + [f"{r['Name']} · {r['ID']}"
-                                   for _, r in base.iterrows()],
-                key="reenroll_pick")
-            if target and st.button("🔄 Open re-enroll", type="primary"):
-                nm, pidx = target.rsplit(" · ", 1)
-                reenroll_dialog(pidx)
 
-            st.divider()
-            st.markdown("**🗑️ Delete student** — removes the student and "
-                        "their face data from all classes. Attendance "
-                        "history is kept (name shown as *(removed "
-                        "student)*). This cannot be undone — consider a "
-                        "backup first (Settings → ⬇️).")
-            del_target = st.selectbox(
-                "Student to delete",
-                [""] + [f"{r['Name']} · {r['ID']}"
-                        for _, r in base.iterrows()],
-                key="del_pick")
-            if del_target and st.button("🗑️ Delete student…", type="primary"):
-                nm, pidx = del_target.rsplit(" · ", 1)
-                confirm_delete_student(pidx)
+            del_ids = ed.loc[ed["🗑️"], "ID"].tolist() if "🗑️" in ed else []
+            if del_ids and c2.button(f"🗑️ Delete {len(del_ids)} student(s)…",
+                                     type="primary"):
+                confirm_delete_students(del_ids)
+
+            pick = st.selectbox(
+                "🔄 Re-enroll (capture fresh samples)",
+                [""] + [f"{r['Name']} · {r['ID']}" for _, r in base.iterrows()],
+                key="reenroll_pick")
+            if pick and c3.button("🔄 Open re-enroll"):
+                nm, pidx = pick.rsplit(" · ", 1)
+                reenroll_dialog(pidx)
 
 
 @st.dialog("🔄 Re-enroll samples")
@@ -1149,38 +1146,42 @@ def reenroll_dialog(pid: str):
         st.rerun()
 
 
-@st.dialog("🗑️ Delete this student?")
-def confirm_delete_student(pid: str):
+@st.dialog("🗑️ Delete student(s)?")
+def confirm_delete_students(pids: list):
     if guest:
         st.error("Not available in the demo sandbox.")
         st.stop()
-    info = people.get(pid, {})
-    name = info.get("name", pid)
     counts = store.sample_counts()
-    in_classes = [cid for cid, cls in classes.items()
-                  if pid in cls.get("students", [])]
-    n_rec = int((store.records_df().ID == pid).sum())
-    st.error("This permanently removes the student and their face data. "
-             "It cannot be undone.")
-    st.markdown(
-        f"**{name}** · `{pid}`  \n"
-        f"• Face samples to delete: **{counts.get(pid, 0)}**  \n"
-        f"• Removed from classes: **{', '.join(in_classes) or 'none'}**  \n"
-        f"• Attendance records kept (name scrubbed): **{n_rec}**")
-    st.caption("💡 Tip: Settings → ⬇️ Download full backup first, if you "
-               "might need to restore.")
+    total_samples, total_records = 0, 0
+    st.error("This permanently removes the selected student(s) and their "
+             "face data. Attendance history is kept (names shown as "
+             "*(removed student)*). Cannot be undone.")
+    for p in pids:
+        info = people.get(p, {})
+        in_cls = [cid for cid, cls in classes.items()
+                  if p in cls.get("students", [])]
+        n_s = counts.get(p, 0)
+        n_r = int((store.records_df().ID == p).sum())
+        total_samples += n_s
+        total_records += n_r
+        st.markdown(f"• **{info.get('name', p)}** · `{p}` — "
+                    f"{n_s} sample(s), {len(in_cls)} class(es), "
+                    f"{n_r} record(s) kept")
+    st.caption(f"Total: {total_samples} sample(s) deleted, "
+               f"{total_records} record(s) kept (scrubbed). "
+               f"💡 Backup first: Settings → ⬇️.")
     c1, c2 = st.columns(2)
     if c1.button("Cancel", width="stretch"):
         st.rerun()
-    if c2.button("🗑️ Delete permanently", type="primary", width="stretch"):
-        result = store.delete_student(pid, actor=ACTOR)
-        if result:
-            flash("success", f"Deleted **{result['name']}** (`{pid}`) — "
-                  f"{result['samples']} sample(s), "
-                  f"{len(result['classes'])} class roster(s), "
-                  f"{result['records']} record(s) kept (scrubbed).")
-        else:
-            flash("error", f"`{pid}` not found — already deleted?")
+    if c2.button(f"🗑️ Delete {len(pids)} permanently", type="primary",
+                 width="stretch"):
+        done = 0
+        for p in pids:
+            if store.delete_student(p, actor=ACTOR):
+                done += 1
+        flash("success" if done else "error",
+              f"Deleted {done} student(s)." if done
+              else "Nothing deleted — already gone?")
         st.rerun()
 
 
@@ -1606,5 +1607,5 @@ with st.sidebar:
     if st.button("Log out", width="stretch"):
         st.session_state.clear()
         st.rerun()
-    st.caption("v2.20.0 · self-hosted · data stays local")
+    st.caption("v2.23.0 · self-hosted · data stays local")
 pg.run()
