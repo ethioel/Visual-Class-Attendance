@@ -141,7 +141,7 @@ def _app_base_url() -> str:
     return ""
 
 
-# ---------------- theming: single source of truth = CSS variables ----------
+# ---------------- theming: widget key is the single state owner ------------
 def _theme_is_dark() -> bool:
     try:
         return str(getattr(st.context.theme, "type", "light")).lower() == "dark"
@@ -150,8 +150,6 @@ def _theme_is_dark() -> bool:
 
 
 def _inject_css(hide_sidebar: bool = False, dark=None) -> None:
-    """Delegates to ui.inject_css (variable-driven). Safe against stale
-    ui.py: falls back to native theme, never crashes."""
     try:
         from attendance.ui import inject_css as _ui_css
         _ui_css(hide_sidebar=hide_sidebar, dark=dark)
@@ -160,16 +158,23 @@ def _inject_css(hide_sidebar: bool = False, dark=None) -> None:
 
 
 def _dark_toggle(right: bool = True) -> bool:
+    """THE toggle. st.session_state['dark_toggle'] (the widget key) is the
+    single owner of the preference — no mirror variable, no races."""
     c1, c2 = st.columns([9, 1]) if right else st.columns([1, 2])
     with c2:
-        dark = st.toggle("🌓", value=st.session_state.get(
-            "dark_mode", _theme_is_dark()), key="dark_toggle", help="Dark mode")
-    st.session_state["dark_mode"] = dark
+        dark = st.toggle(
+            "🌓",
+            value=st.session_state.get("dark_toggle", _theme_is_dark()),
+            key="dark_toggle",
+            help="Dark mode",
+        )
     return dark
 
 
 def _dark_active() -> bool:
-    return bool(st.session_state.get("dark_mode", _theme_is_dark()))
+    if "dark_toggle" in st.session_state:
+        return bool(st.session_state["dark_toggle"])
+    return _theme_is_dark()
 
 
 def _render_heatmap(cid: str, month: str):
@@ -201,11 +206,8 @@ def _render_heatmap(cid: str, month: str):
 
 def capture_section(pid: str, name: str, store: Store, cfg: Config,
                     class_targets=None, on_saved=None):
-    """Hands-free enrollment. Uses the exact same camera path as the working
-    attendance loop (camera_frame_bgr — no explicit key). Anti-stall: once a
-    single face is detected, a capture is forced after 12s regardless of the
-    quality gate, so 5 photos always complete. Mode switching does a full
-    rerun (radio outside the fragment) which unmounts the other camera."""
+    """Hands-free enrollment: attendance-identical camera path, anti-stall
+    forced capture, Add more / Recapture all, in-fragment Save."""
     class_targets = class_targets or []
     cap = st.session_state.setdefault(f"cap::{pid}", {"samples": [], "thumbs": []})
     done_key = f"autodone::{pid}"
@@ -276,7 +278,6 @@ def capture_section(pid: str, name: str, store: Store, cfg: Config,
                         st.rerun()
                 return
 
-            # ---- capture tick: exact attendance camera path (no key) ----
             frame = camera_frame_bgr()
             if frame is None:
                 with cam_col:
@@ -297,7 +298,6 @@ def capture_section(pid: str, name: str, store: Store, cfg: Config,
             n = len(cap["samples"])
             now = time.time()
             if n < cfg.n_samples and len(locs) == 1:
-                # anti-stall clock: starts at the first single-face frame
                 if st.session_state.get(f"fs::{pid}") is None:
                     st.session_state[f"fs::{pid}"] = now
                 stalled = now - st.session_state[f"fs::{pid}"] > 12.0
@@ -307,14 +307,14 @@ def capture_section(pid: str, name: str, store: Store, cfg: Config,
                     cap["samples"].append(encs[0])
                     cap["thumbs"].append(face_thumb(rgb, locs[0], 96))
                     st.session_state[f"lc::{pid}"] = now
-                    st.session_state[f"fs::{pid}"] = now      # reset window
+                    st.session_state[f"fs::{pid}"] = now
                     n += 1
                     st.toast(f"Sample {n}/{cfg.n_samples} captured"
                              + ("" if gated_ok
                                 else " — forced, check lighting"), icon="📸")
             elif n >= cfg.n_samples:
                 st.session_state[done_key] = True
-                st.rerun()                       # one full rerun → Save visible
+                st.rerun()
 
             with cam_col:
                 suggestion_box(live_suggestion(len(locs), bright, sharp)
@@ -1101,8 +1101,10 @@ def page_students():
                 flash("success" if n else "info",
                       f"Renamed {n} student(s)." if n else "No changes.")
                 st.rerun()
+            st.divider()
             st.markdown("**🔄 Re-enroll** — capture fresh samples for an "
-                        "existing student.")
+                        "existing student (their samples are *added*, never "
+                        "replaced, and the student is never removed).")
             target = st.selectbox(
                 "Student", [""] + [f"{r['Name']} · {r['ID']}"
                                    for _, r in base.iterrows()],
@@ -1116,7 +1118,7 @@ def page_students():
 def reenroll_dialog(pid: str):
     name = people.get(pid, {}).get("name", pid)
     st.caption(f"New samples for **{name}** (`{pid}`) — added on top of "
-               "existing ones.")
+               "existing ones. The student record is never deleted.")
     capture_section(pid, name, store, cfg,
                     on_saved=lambda p: st.session_state.__setitem__(
                         f"reenroll_done::{p}", True))
@@ -1547,5 +1549,5 @@ with st.sidebar:
     if st.button("Log out", width="stretch"):
         st.session_state.clear()
         st.rerun()
-    st.caption("v2.15.2 · self-hosted · data stays local")
+    st.caption("v2.16.0 · self-hosted · data stays local")
 pg.run()
